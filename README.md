@@ -17,16 +17,6 @@ This repository currently contains the routing implementation and its core tests
 
 The decode path keeps routing scores and state on the accelerator. Normal attention uses PyTorch SDPA; only the small visual attention distribution needed by the router is computed separately. Tree construction happens once on the CPU when a prompt starts.
 
-## Install
-
-```bash
-git submodule update --init
-python -m pip install -e third_party/lmms-eval
-python -m pip install -e ".[dev,smoke]"
-```
-
-The local `lmms-eval` submodule pins the evaluation integration used by TokenFovea. The environment still needs a compatible CUDA PyTorch stack and the model dependencies required by lmms-eval.
-
 ## Run
 
 ```bash
@@ -63,7 +53,7 @@ Current constraints for routed modes: image input only, batch size one, `num_bea
 ## Test
 
 ```bash
-pytest
+pytest tests
 ```
 
 The routing-only dynamic-resolution smoke test can be run without loading a VLM:
@@ -71,3 +61,10 @@ The routing-only dynamic-resolution smoke test can be run without loading a VLM:
 ```bash
 python scripts/smoke_dynamic_resolution.py test.png
 ```
+
+## E1 Head discovery
+
+The no-ROI visual routing Head probe is implemented separately under `experiments/e1`. It measures
+full-context visual attention, visual-only HybridKV dynamics, and null-calibrated 3×3 GazeScore,
+then exports Top-4/8/16 `head_selection.json` candidates and an HTML report. See
+[`experiments/e1/README.md`](experiments/e1/README.md) for NVIDIA setup and commands.

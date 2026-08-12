@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from ...session import FoveaSession
-from .common import attention, rotate_partial_key, visual_attention_signal
+from .common import attention, rotate_partial_key, validate_cache_result, visual_attention_signal
 
 
 def make_forward(original, session: FoveaSession):
@@ -67,18 +67,31 @@ def make_forward(original, session: FoveaSession):
                 hidden_states,
                 projector,
             )
-            return original(
-                hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                **kwargs,
+            full_key, full_value = (
+                past_key_values.update(rotated_key, value, module.layer_idx)
+                if past_key_values is not None
+                else (rotated_key, value)
             )
+            if past_key_values is not None:
+                validate_cache_result(past_key_values, full_key, module.layer_idx)
+            output_attentions = bool(kwargs.get("output_attentions", False))
+            output, weights = attention(
+                rotated_query,
+                full_key,
+                full_value,
+                module.num_key_value_groups,
+                module.scaling,
+                output_attentions,
+                attention_mask,
+            )
+            output = output.reshape(*input_shape, -1) * torch.sigmoid(gate)
+            return module.o_proj(output), weights
 
         if past_key_values is None:
             raise RuntimeError("TokenFovea decode requires a populated KV cache")
         session.validate_decode_batch(hidden_states.shape[0])
         full_key, full_value = past_key_values.update(rotated_key, value, module.layer_idx)
+        validate_cache_result(past_key_values, full_key, module.layer_idx)
         key, composed_value, active_ids = session.compose(module.layer_idx, full_key, full_value, raw_key)
         composed_mask = session.compose_attention_mask(attention_mask, active_ids, full_key.shape[-2])
         visual_signal = (

@@ -16,7 +16,7 @@ class FoveaConfig:
     signal_aggregation: Literal["mean", "max"] = "mean"
     anchor_window: float = 8.0
     update_interval: int = 1
-    max_swaps: int = 500
+    max_swaps: int = 100
     epsilon: float = 0.05
     attention_ema: float = 0.0
     score_mode: Literal["mass", "density"] = "mass"

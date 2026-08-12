@@ -1,0 +1,31 @@
+seed: 42
+data_dir: data/e1
+output_dir: outputs/e1
+
+natural_sources:
+  - name: coco2017_cap_val
+    dataset_name: coco2017_cap_val
+    count: 100
+  - name: flickr30k_test
+    dataset_name: flickr30k_test
+    count: 100
+  - name: nocaps_val
+    dataset_name: nocaps_val
+    count: 100
+
+controlled_count: 100
+generation_tokens: 32
+basic_keep_fraction: 0.20
+hybrid_top_fraction: 0.05
+visualization_natural: 12
+visualization_controlled: 6
+
+models:
+  qwen25:
+    pretrained: Qwen/Qwen2.5-VL-7B-Instruct
+    min_pixels: 200704
+    max_pixels: 1605632
+  qwen35:
+    pretrained: Qwen/Qwen3.5-9B
+    min_pixels: 65536
+    max_pixels: 131072

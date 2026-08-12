@@ -49,6 +49,19 @@ def repeat_kv(states: torch.Tensor, repeats: int) -> torch.Tensor:
     )
 
 
+def validate_cache_result(cache: Any, keys: torch.Tensor, layer_idx: int) -> None:
+    get_seq_length = getattr(cache, "get_seq_length", None)
+    if not callable(get_seq_length):
+        raise TypeError("TokenFovea requires a cache exposing get_seq_length()")
+    logical_length = int(get_seq_length(layer_idx))
+    physical_length = keys.shape[-2]
+    if logical_length != physical_length:
+        raise ValueError(
+            "TokenFovea requires cache updates to return only populated K/V entries; "
+            f"layer {layer_idx} returned {physical_length} entries for a logical length of {logical_length}"
+        )
+
+
 def attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -70,6 +83,25 @@ def attention(
             attention_mask = attention_mask != 0
         elif attention_mask.is_floating_point():
             attention_mask = attention_mask.to(query.dtype)
+    query_length = query.shape[-2]
+    key_length = key.shape[-2]
+    use_sdpa_causal = (
+        query_length > 1 and query_length == key_length and attention_mask is None and not output_attentions
+    )
+    if query_length > 1:
+        if key_length < query_length:
+            raise ValueError("self-attention key length cannot be shorter than query length")
+        if not use_sdpa_causal:
+            query_positions = torch.arange(query_length, device=query.device)[:, None]
+            key_positions = torch.arange(key_length, device=query.device)[None, :]
+            causal_mask = key_positions <= query_positions + key_length - query_length
+            causal_mask = causal_mask[None, None]
+            if attention_mask is None:
+                attention_mask = causal_mask
+            elif attention_mask.dtype == torch.bool:
+                attention_mask = attention_mask & causal_mask
+            else:
+                attention_mask = attention_mask.masked_fill(~causal_mask, -torch.inf)
     if output_attentions:
         repeated_key = repeat_kv(key, groups)
         repeated_value = repeat_kv(value, groups)
@@ -89,7 +121,7 @@ def attention(
             value,
             attn_mask=attention_mask,
             dropout_p=0.0,
-            is_causal=False,
+            is_causal=use_sdpa_causal,
             scale=scaling,
             enable_gqa=groups > 1,
         )

@@ -18,7 +18,7 @@ def aligned_size(height: int, width: int, factor: int) -> tuple[int, int]:
 def leaf_target(image: Image.Image, grid: tuple[int, int], center: tuple[float, float]) -> torch.Tensor:
     height, width = grid
     pixels = image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
-    rgb = torch.tensor(list(pixels.get_flattened_data()), dtype=torch.float32).reshape(height, width, 3) / 255.0
+    rgb = torch.tensor(list(pixels.getdata()), dtype=torch.float32).reshape(height, width, 3) / 255.0
     luminance = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
     edge = torch.zeros_like(luminance)
     edge[:, 1:] += (luminance[:, 1:] - luminance[:, :-1]).abs()

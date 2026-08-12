@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import types
 from dataclasses import dataclass
 from typing import Any
@@ -31,6 +32,11 @@ def install_tokenfovea(model: torch.nn.Module, session: FoveaSession) -> PatchHa
     model_type = getattr(model_any.config, "model_type", "")
     if model_type not in {"qwen2_5_vl", "qwen3_5"}:
         raise ValueError(f"unsupported model_type: {model_type}")
+    attention_backend = getattr(model_any.config, "_attn_implementation", None)
+    if session.enabled and attention_backend != "sdpa":
+        raise ValueError(
+            f"TokenFovea routed modes require attn_implementation='sdpa', got {attention_backend!r}"
+        )
     language_model: Any = model_any.model.language_model
     image_token_id = int(model_any.config.image_token_id)
     spatial_merge_size = int(model_any.config.vision_config.spatial_merge_size)
@@ -65,13 +71,30 @@ def install_tokenfovea(model: torch.nn.Module, session: FoveaSession) -> PatchHa
         routed_layers.append(layer_index)
         patched_modules.append((module, original))
     session.attach(routed_layers, position_encoder, rotate_key)
+    model_forward_signature = inspect.signature(model.forward)
+    language_forward_signature = inspect.signature(language_model.forward)
+
+    def call_arguments(signature: inspect.Signature, args, kwargs) -> dict[str, Any]:
+        arguments = dict(kwargs)
+        bound = signature.bind_partial(*args, **kwargs)
+        for name, value in bound.arguments.items():
+            if signature.parameters[name].kind == inspect.Parameter.VAR_KEYWORD:
+                arguments.update(value)
+            else:
+                arguments[name] = value
+        return arguments
 
     def model_pre_hook(_module, args, kwargs):
-        input_ids = kwargs.get("input_ids")
-        inputs_embeds = kwargs.get("inputs_embeds")
-        past_key_values = kwargs.get("past_key_values")
-        image_grid = kwargs.get("image_grid_thw")
-        video_grid = kwargs.get("video_grid_thw")
+        arguments = call_arguments(model_forward_signature, args, kwargs)
+        input_ids = arguments.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        inputs_embeds = arguments.get("inputs_embeds")
+        past_key_values = arguments.get("past_key_values")
+        image_grid = arguments.get("image_grid_thw")
+        video_grid = arguments.get("video_grid_thw")
+        if past_key_values is not None and not callable(getattr(past_key_values, "get_seq_length", None)):
+            raise TypeError("TokenFovea requires a cache exposing get_seq_length()")
         new_prompt = (input_ids is not None or inputs_embeds is not None) and (
             past_key_values is None or past_key_values.get_seq_length() == 0
         )
@@ -88,7 +111,8 @@ def install_tokenfovea(model: torch.nn.Module, session: FoveaSession) -> PatchHa
             session.configure_prompt(input_ids, image_grid, image_token_id, spatial_merge_size)
 
     def language_pre_hook(_module, args, kwargs):
-        session.observe_position_ids(kwargs.get("position_ids"))
+        arguments = call_arguments(language_forward_signature, args, kwargs)
+        session.observe_position_ids(arguments.get("position_ids"))
 
     hooks = [
         model.register_forward_pre_hook(model_pre_hook, with_kwargs=True),

@@ -12,7 +12,22 @@ from tokenfovea.session import FoveaSession
 
 
 def _bool(value: Any) -> bool:
-    return value if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value: {value!r}")
+
+
+def _validate_attention_backend(attn_implementation: Any, config: FoveaConfig) -> None:
+    if config.mode != "full" and attn_implementation != "sdpa":
+        raise ValueError(
+            "TokenFovea routed modes require attn_implementation='sdpa', "
+            f"got {attn_implementation!r}"
+        )
 
 
 def _config_from_args(
@@ -76,13 +91,15 @@ class TokenFoveaQwen25VL(_TokenFoveaLMMSMixin, Qwen2_5_VL):
         **kwargs,
     ):
         fovea_args = {key: kwargs.pop(key) for key in list(kwargs) if key.startswith("fovea_")}
+        fovea_config = _config_from_args(**fovea_args)
+        _validate_attention_backend(attn_implementation, fovea_config)
         super().__init__(
             pretrained=pretrained,
             batch_size=batch_size,
             attn_implementation=attn_implementation,
             **kwargs,
         )
-        self._install_fovea(_config_from_args(**fovea_args))
+        self._install_fovea(fovea_config)
 
 
 class TokenFoveaQwen35(_TokenFoveaLMMSMixin, Qwen3_5):
@@ -95,6 +112,8 @@ class TokenFoveaQwen35(_TokenFoveaLMMSMixin, Qwen3_5):
         **kwargs,
     ):
         fovea_args = {key: kwargs.pop(key) for key in list(kwargs) if key.startswith("fovea_")}
+        fovea_config = _config_from_args(**fovea_args)
+        _validate_attention_backend(attn_implementation, fovea_config)
         super().__init__(
             pretrained=pretrained,
             batch_size=batch_size,
@@ -102,4 +121,4 @@ class TokenFoveaQwen35(_TokenFoveaLMMSMixin, Qwen3_5):
             enable_thinking=_bool(enable_thinking),
             **kwargs,
         )
-        self._install_fovea(_config_from_args(**fovea_args))
+        self._install_fovea(fovea_config)
