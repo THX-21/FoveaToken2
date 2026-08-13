@@ -68,3 +68,8 @@ The no-ROI visual routing Head probe is implemented separately under `experiment
 full-context visual attention, visual-only HybridKV dynamics, and null-calibrated 3×3 GazeScore,
 then exports Top-4/8/16 `head_selection.json` candidates and an HTML report. See
 [`experiments/e1/README.md`](experiments/e1/README.md) for NVIDIA setup and commands.
+
+## E2 coarse visual representation
+
+The independent E2 module compares uniform and random multiscale visual pooling with token-matched native
+low-resolution inputs on four lmms-eval Lite tasks. See [`experiments/e2/README.md`](experiments/e2/README.md).

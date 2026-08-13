@@ -1,0 +1,25 @@
+seed: 42
+sample_count: 100
+max_new_tokens: 16
+data_dir: data/e2
+output_dir: outputs/e2
+
+tasks:
+  - vqav2_val_lite
+  - gqa_lite
+  - textvqa_val_lite
+  - chartqa_lite
+
+area_ratios: [0.50, 0.30, 0.20]
+
+models:
+  qwen25:
+    pretrained: Qwen/Qwen2.5-VL-7B-Instruct
+    min_pixels: 200704
+    max_pixels: 1605632
+    pixel_per_token: 28
+  qwen35:
+    pretrained: Qwen/Qwen3.5-9B
+    min_pixels: 65536
+    max_pixels: 131072
+    pixel_per_token: 32
