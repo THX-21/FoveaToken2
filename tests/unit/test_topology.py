@@ -10,3 +10,18 @@ class TopologyTest(unittest.TestCase):
         for budget in (2, 7, 16, 31, 59):
             active = forest.initial_front(budget)
             forest.validate_front(active)
+
+    def test_aligned_forest_contains_only_native_square_scales(self):
+        forest = VisualTokenForest.from_aligned_grids([(8, 16), (8, 8)])
+
+        self.assertEqual(forest.num_leaves, 192)
+        self.assertEqual(len(forest.roots), 3)
+        self.assertEqual(
+            {(node.y1 - node.y0, node.x1 - node.x0) for node in forest.nodes},
+            {(1, 1), (2, 2), (4, 4), (8, 8)},
+        )
+        forest.validate_front(forest.roots)
+
+    def test_aligned_forest_rejects_non_aligned_grids(self):
+        with self.assertRaisesRegex(ValueError, "divisible by 8"):
+            VisualTokenForest.from_aligned_grids([(8, 12)])

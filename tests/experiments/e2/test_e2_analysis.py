@@ -19,7 +19,12 @@ class E2AnalysisTest(unittest.TestCase):
                 sample_count=1,
                 models={"qwen25": ModelSpec("fake", 1, 2, 28)},
             )
-            for condition, score in (("full", 1.0), ("lowres_2", 0.0), ("uniform2_kv_center", 1.0)):
+            for condition, score in (
+                ("full", 1.0),
+                ("lowres_2", 0.0),
+                ("uniform2_kv_center", 0.5),
+                ("native_uniform4", 1.0),
+            ):
                 target = root / "qwen25" / condition
                 target.mkdir(parents=True)
                 (target / "results.json").write_text(json.dumps({
@@ -39,7 +44,12 @@ class E2AnalysisTest(unittest.TestCase):
             report = build_report(config, "qwen25")
 
             uniform = next(row for row in rows if row["condition"] == "uniform2_kv_center" and row["task"] == "vqav2_val_lite")
-            self.assertEqual(uniform["gain_lowres"], 1.0)
+            self.assertEqual(uniform["gain_lowres"], 0.5)
+            native = next(
+                row for row in rows
+                if row["condition"] == "native_uniform4" and row["task"] == "vqav2_val_lite"
+            )
+            self.assertEqual(native["gain_kv_pooling"], 0.5)
             self.assertTrue(report.exists())
 
 

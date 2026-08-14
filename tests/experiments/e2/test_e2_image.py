@@ -24,6 +24,13 @@ class E2ImagePlanTest(unittest.TestCase):
         self.assertLessEqual(plan.grid_width, high.grid_width)
         self.assertLessEqual(plan.grid_height, high.grid_height)
 
+    def test_scale64_lowres_plan_is_supported_for_aligned_inputs(self):
+        image = Image.new("RGB", (1024, 1024))
+        high = aligned_high_resolution(image, 32, 65536, 1048576)
+        if high.grid_width % 8 or high.grid_height % 8:
+            self.skipTest("chosen E2 plan is intentionally only four-aligned")
+        self.assertEqual(lowres_plan(high, 8).visual_tokens, high.visual_tokens // 64)
+
 
 if __name__ == "__main__":
     unittest.main()

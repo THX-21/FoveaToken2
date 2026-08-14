@@ -35,7 +35,7 @@ Main arguments:
 - `fovea_mode=dynamic|uniform|full`
 - `fovea_budget`
 - `fovea_position_mode=native_center|text_anchor|no_rope|post_rope_pool`
-- `fovea_pooling_mode=kv|hidden`
+- `fovea_pooling_mode=kv|hidden|native_multiscale`
 - `fovea_signal_selection=/path/to/head_selection.json` (optional; all heads are used when omitted)
 - `fovea_signal_aggregation=mean|max`
 - `fovea_anchor_window` (used only by `text_anchor`)
@@ -49,6 +49,13 @@ Main arguments:
 `fovea_budget` is a target number of active visual nodes, not a pixel limit. The actual front size is the closest size reachable by the ragged quadtree and cannot exceed the number of visual tokens produced by the model processor. Image resolution is controlled separately by the lmms-eval model arguments `min_pixels` and `max_pixels`; `total_pixels` applies to video preprocessing, which TokenFovea does not currently support. For multiple images, `max_pixels` is applied to each image independently.
 
 Current constraints for routed modes: image input only, batch size one, `num_beams=1`, and `use_cache=true`. The full multi-scale KV pyramid still occupies memory proportional to the original visual-token count. If `fovea_budget` is greater than or equal to the processed visual-token count, the front contains all leaf nodes and no spatial compression occurs.
+
+`native_multiscale` replaces pooled parent K/V with K/V captured from native `/2`, `/4`, and `/8`
+image prefills (area scales 4, 16, and 64). It requires `position_mode=native_center`, aligns each
+LLM visual grid to a multiple of eight, and adds three auxiliary prefills per sample. The auxiliary
+caches are discarded, while the per-layer native visual bank and the original generation cache are
+retained. This mode validates native multiscale representation quality; it is not yet a prefill or
+memory optimization.
 
 ## Test
 
@@ -71,5 +78,6 @@ then exports Top-4/8/16 `head_selection.json` candidates and an HTML report. See
 
 ## E2 coarse visual representation
 
-The independent E2 module compares uniform and random multiscale visual pooling with token-matched native
-low-resolution inputs on four lmms-eval Lite tasks. See [`experiments/e2/README.md`](experiments/e2/README.md).
+The independent E2 module compares uniform and random multiscale visual pooling, native multiscale K/V,
+and token-matched low-resolution inputs on four lmms-eval Lite tasks. See
+[`experiments/e2/README.md`](experiments/e2/README.md).

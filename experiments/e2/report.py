@@ -48,8 +48,9 @@ th,td{{border:1px solid #ccc;padding:5px 8px}}th{{background:#eee;position:stick
 
 _COLUMNS = (
     "condition", "task", "score", "delta_full", "lowres_baseline", "gain_lowres",
-    "full_correct_retention", "token_agreement", "prefill_seconds", "decode_seconds", "total_seconds",
-    "first_token_agreement",
+    "gain_kv_pooling", "gain_hidden_pooling", "gain_postrope_pooling",
+    "full_correct_retention", "token_agreement", "prefill_seconds", "decode_seconds",
+    "native_prefill_seconds", "native_bank_tokens", "total_seconds", "first_token_agreement",
 )
 
 
@@ -63,7 +64,10 @@ def _format(value: Any) -> str:
 
 def _render_fronts(root: Path, assets: Path) -> list[tuple[str, Path]]:
     images = []
-    for condition in ("random_fixed_kv_center", "random_perstep_kv_center"):
+    for condition in (
+        "random_fixed_kv_center", "random_fixed_native",
+        "random_perstep_kv_center", "random_perstep_native",
+    ):
         trace = root / condition / "front_traces.jsonl"
         if not trace.exists():
             continue
@@ -75,7 +79,7 @@ def _render_fronts(root: Path, assets: Path) -> list[tuple[str, Path]]:
         scale = max(2, 320 // max(height, width))
         image = Image.new("RGB", (width * scale, height * scale), "white")
         draw = ImageDraw.Draw(image)
-        colors = {1: "#4daf4a", 2: "#377eb8", 4: "#e41a1c"}
+        colors = {1: "#4daf4a", 2: "#377eb8", 4: "#e41a1c", 8: "#984ea3"}
         for y, x, size in record["nodes"]:
             draw.rectangle(
                 (x * scale, y * scale, (x + size) * scale - 1, (y + size) * scale - 1),

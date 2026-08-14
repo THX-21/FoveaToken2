@@ -5,8 +5,8 @@ from pathlib import Path
 import torch
 
 from experiments.e2.conditions import get_condition
-from experiments.e2.front import BlockFront
-from experiments.e2.session import LayerSource
+from experiments.e2.front import BlockFront, BlockNode
+from experiments.e2.session import LayerSource, NativeLayerSource
 from experiments.e2.session import E2Session
 
 
@@ -16,6 +16,34 @@ def _encoder(reference, positions):
 
 
 class E2SessionTest(unittest.TestCase):
+    def test_native_auxiliary_banks_feed_uniform_front(self):
+        session = E2Session(get_condition("native_uniform4"))
+        session.attach([0], _encoder, "qwen2_5_vl")
+        session.begin_sample("native")
+        for area, grid in ((4, 2), (16, 1)):
+            session.begin_native_capture(area)
+            ids = torch.tensor([[1] + [99] * (grid * grid) + [2]])
+            session.configure_native_capture_prompt(
+                ids, torch.tensor([[1, grid * 2, grid * 2]]), 99, 2
+            )
+            raw = torch.full((1, 1, ids.shape[-1], 1), float(area))
+            session.capture_layer(0, raw, raw + 100, raw, torch.zeros(1, ids.shape[-1], 1), None)
+            session.end_native_capture()
+
+        main_ids = torch.tensor([[1] + [99] * 16 + [2]])
+        session.configure_prompt(
+            "native", main_ids, torch.tensor([[1, 8, 8]]), 99, 2
+        )
+        positions = torch.arange(main_ids.shape[-1]).view(1, 1, -1).expand(3, -1, -1)
+        session.observe_position_ids(positions)
+        raw = torch.ones(1, 1, main_ids.shape[-1], 1)
+        session.capture_layer(0, raw, raw + 100, raw, torch.zeros(1, main_ids.shape[-1], 1), None)
+        keys, values, _, _ = session.prefill_compact(0, raw, raw, raw)
+
+        self.assertTrue(torch.equal(keys[..., :4, :], torch.full_like(keys[..., :4, :], 4.0)))
+        self.assertTrue(torch.equal(values[..., :4, :], torch.full_like(values[..., :4, :], 104.0)))
+        self.assertEqual(session.native_bank_tokens, 21)
+
     def _session(self, condition_name):
         session = E2Session(get_condition(condition_name), seed=42)
         session.attach([0, 4], _encoder, "qwen2_5_vl")
@@ -95,6 +123,44 @@ class E2SessionTest(unittest.TestCase):
         self.assertAlmostEqual(float(hidden_values[0, 0, 0, 0]), float(hidden[..., 1].mean() + 1))
         self.assertAlmostEqual(float(post_keys[0, 0, 0, 0]), 107.5)
         self.assertAlmostEqual(float(post_values[0, 0, 0, 0]), 17.5)
+
+    def test_native_source_uses_scale_specific_tokens_in_front_order(self):
+        leaves = lambda y, x, size: tuple(
+            row * 4 + column
+            for row in range(y, y + size)
+            for column in range(x, x + size)
+        )
+        nodes = [BlockNode(0, 0, 2, leaves(0, 0, 2))]
+        nodes.extend(
+            BlockNode(y, x, 1, leaves(y, x, 1))
+            for y in range(4)
+            for x in range(4)
+            if not (y < 2 and x < 2)
+        )
+        front = BlockFront(4, 4, tuple(nodes), {1: 12, 2: 1, 4: 0})
+        front.validate()
+        raw = {
+            1: torch.arange(16, dtype=torch.float32).view(1, 1, 16, 1),
+            4: (100 + torch.arange(4, dtype=torch.float32)).view(1, 1, 4, 1),
+            16: torch.tensor([[[[200.0]]]]),
+        }
+        values = {scale: tensor + 1000 for scale, tensor in raw.items()}
+        positions = torch.arange(16, dtype=torch.float32).view(1, 1, 16).expand(3, -1, -1)
+        source = NativeLayerSource(
+            raw, values, {1: (4, 4), 4: (2, 2), 16: (1, 1)}, positions
+        )
+
+        keys, gathered_values = source.gather(
+            front,
+            get_condition("random_fixed_native"),
+            _encoder,
+            raw[1],
+            lambda key, cos, sin: key,
+        )
+
+        self.assertEqual(float(keys[0, 0, 0, 0]), 100.0)
+        self.assertEqual(float(gathered_values[0, 0, 0, 0]), 1100.0)
+        self.assertEqual(float(keys[0, 0, 1, 0]), 2.0)
 
 
 if __name__ == "__main__":

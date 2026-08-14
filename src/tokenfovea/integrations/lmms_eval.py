@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import types
 from typing import Any
+
+import torch
 
 from lmms_eval.models.simple.qwen2_5_vl import Qwen2_5_VL
 from lmms_eval.models.simple.qwen3_5 import Qwen3_5
 
 from tokenfovea.config import FoveaConfig
 from tokenfovea.integrations.qwen import install_tokenfovea
+from tokenfovea.multiscale import NativeProcessorProxy
 from tokenfovea.session import FoveaSession
 
 
@@ -72,6 +76,10 @@ class _TokenFoveaLMMSMixin:
     batch_size: Any
     use_cache: bool
     model: Any
+    processor: Any
+    device: Any
+    min_pixels: Any
+    max_pixels: Any
 
     def _install_fovea(self, config: FoveaConfig) -> None:
         if config.mode != "full" and int(self.batch_size) != 1:
@@ -80,6 +88,39 @@ class _TokenFoveaLMMSMixin:
             raise ValueError("TokenFovea requires use_cache=True")
         self.fovea_session = FoveaSession(config)
         self.fovea_patch = install_tokenfovea(self.model, self.fovea_session)
+        if config.mode != "full" and config.pooling_mode == "native_multiscale":
+            vision = self.model.config.vision_config
+            patch_size = int(getattr(vision, "patch_size"))
+            merge_size = int(getattr(vision, "spatial_merge_size"))
+            self.processor = NativeProcessorProxy(
+                self.processor,
+                pixel_per_token=patch_size * merge_size,
+                min_pixels=int(self.min_pixels),
+                max_pixels=int(self.max_pixels),
+            )
+            original_generate = self.model.generate
+
+            def generate_with_native(model, *args, **kwargs):
+                pending = kwargs.pop("_tokenfovea_native_inputs", None)
+                if pending is None:
+                    raise RuntimeError("native_multiscale processor inputs were not prepared")
+                device = kwargs.get("input_ids").device if kwargs.get("input_ids") is not None else self.device
+                self.fovea_session.begin_native_sample()
+                try:
+                    for area_scale in (4, 16, 64):
+                        auxiliary = pending[area_scale]
+                        auxiliary = auxiliary.to(device) if hasattr(auxiliary, "to") else auxiliary
+                        self.fovea_session.begin_native_capture(area_scale)
+                        with torch.inference_mode():
+                            output = model(**auxiliary, use_cache=True, return_dict=True)
+                        del output
+                        self.fovea_session.end_native_capture()
+                    return original_generate(*args, **kwargs)
+                except Exception:
+                    self.fovea_session.abort_native_sample()
+                    raise
+
+            self.model.generate = types.MethodType(generate_with_native, self.model)
 
 
 class TokenFoveaQwen25VL(_TokenFoveaLMMSMixin, Qwen2_5_VL):

@@ -37,8 +37,10 @@ def aligned_high_resolution(
 
 
 def lowres_plan(high: ImagePlan, divisor: int) -> ImagePlan:
-    if divisor not in {2, 4}:
-        raise ValueError("low-resolution divisor must be 2 or 4")
+    if divisor not in {2, 4, 8}:
+        raise ValueError("low-resolution divisor must be 2, 4, or 8")
+    if high.grid_width % divisor or high.grid_height % divisor:
+        raise ValueError("high-resolution grid is not divisible by low-resolution divisor")
     return ImagePlan(
         high.width // divisor,
         high.height // divisor,

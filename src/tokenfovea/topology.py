@@ -112,6 +112,91 @@ class VisualTokenForest:
             leaf_offset += height * width
         return cls([SpatialNode(**draft) for draft in drafts], tuple(roots), grid_tuple)
 
+    @classmethod
+    def from_aligned_grids(
+        cls,
+        grids: Iterable[tuple[int, int]],
+        *,
+        max_block_size: int = 8,
+    ) -> VisualTokenForest:
+        """Build independent exact quadtrees over aligned square macroblocks.
+
+        Unlike :meth:`from_grids`, every node is an aligned square with edge
+        length 1, 2, 4, ..., ``max_block_size``.  Native multiscale banks rely
+        on that one-to-one mapping between tree nodes and native resolutions.
+        """
+        grid_tuple = tuple((int(h), int(w)) for h, w in grids)
+        if not grid_tuple or any(h <= 0 or w <= 0 for h, w in grid_tuple):
+            raise ValueError("grids must contain positive (height, width) pairs")
+        if max_block_size <= 0 or max_block_size & (max_block_size - 1):
+            raise ValueError("max_block_size must be a positive power of two")
+        if any(h % max_block_size or w % max_block_size for h, w in grid_tuple):
+            raise ValueError(
+                f"native multiscale grids must be divisible by {max_block_size}"
+            )
+
+        drafts: list[dict] = []
+        roots: list[int] = []
+        leaf_offset = 0
+
+        def build(
+            image_index: int,
+            width: int,
+            y0: int,
+            x0: int,
+            size: int,
+            depth: int,
+        ) -> int:
+            if size == 1:
+                node_id = len(drafts)
+                drafts.append(
+                    {
+                        "node_id": node_id,
+                        "parent_id": None,
+                        "children": (),
+                        "image_index": image_index,
+                        "y0": y0,
+                        "x0": x0,
+                        "y1": y0 + 1,
+                        "x1": x0 + 1,
+                        "depth": depth,
+                        "leaf_indices": (leaf_offset + y0 * width + x0,),
+                    }
+                )
+                return node_id
+            half = size // 2
+            children = tuple(
+                build(image_index, width, y0 + dy, x0 + dx, half, depth + 1)
+                for dy, dx in ((0, 0), (0, half), (half, 0), (half, half))
+            )
+            node_id = len(drafts)
+            drafts.append(
+                {
+                    "node_id": node_id,
+                    "parent_id": None,
+                    "children": children,
+                    "image_index": image_index,
+                    "y0": y0,
+                    "x0": x0,
+                    "y1": y0 + size,
+                    "x1": x0 + size,
+                    "depth": depth,
+                    "leaf_indices": tuple(i for child in children for i in drafts[child]["leaf_indices"]),
+                }
+            )
+            for child in children:
+                drafts[child]["parent_id"] = node_id
+            return node_id
+
+        for image_index, (height, width) in enumerate(grid_tuple):
+            for y0 in range(0, height, max_block_size):
+                for x0 in range(0, width, max_block_size):
+                    roots.append(build(image_index, width, y0, x0, max_block_size, 0))
+            leaf_offset += height * width
+        forest = cls([SpatialNode(**draft) for draft in drafts], tuple(roots), grid_tuple)
+        forest.validate_front(forest.roots)
+        return forest
+
     def node(self, node_id: int) -> SpatialNode:
         return self.nodes[node_id]
 

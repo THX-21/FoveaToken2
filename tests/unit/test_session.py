@@ -10,6 +10,49 @@ from tokenfovea.session import FoveaSession
 
 
 class SessionTest(unittest.TestCase):
+    def test_native_multiscale_auxiliary_lifecycle_and_scale64_root(self):
+        session = FoveaSession(
+            FoveaConfig(mode="uniform", budget=1, pooling_mode="native_multiscale")
+        )
+        session.attach(
+            [0],
+            lambda reference, positions: (positions, positions),
+            lambda key, cos, sin: key,
+        )
+        session.begin_native_sample()
+        for area, llm_grid in ((4, 4), (16, 2), (64, 1)):
+            session.begin_native_capture(area)
+            input_ids = torch.tensor([[1] + [99] * (llm_grid**2) + [2]])
+            session.configure_native_capture_prompt(
+                input_ids,
+                torch.tensor([[1, llm_grid * 2, llm_grid * 2]]),
+                image_token_id=99,
+                spatial_merge_size=2,
+            )
+            raw = torch.full((1, 1, input_ids.shape[-1], 1), float(area))
+            session.capture_prefill_layer(0, raw, raw + 100, raw, None)
+            session.end_native_capture()
+
+        main_ids = torch.tensor([[1] + [99] * 64 + [2]])
+        session.configure_prompt(
+            main_ids,
+            torch.tensor([[1, 16, 16]]),
+            image_token_id=99,
+            spatial_merge_size=2,
+        )
+        positions = torch.arange(main_ids.shape[-1]).view(1, 1, -1).expand(3, -1, -1)
+        session.observe_position_ids(positions)
+        raw = torch.ones(1, 1, main_ids.shape[-1], 1)
+        session.capture_prefill_layer(0, raw, raw + 100, raw, None)
+
+        full = torch.zeros(1, 1, main_ids.shape[-1] + 1, 1)
+        keys, values, active = session.compose(0, full, full, raw[..., :1, :])
+
+        self.assertEqual(active.numel(), 1)
+        self.assertEqual(float(keys[0, 0, 0, 0]), 64.0)
+        self.assertEqual(float(values[0, 0, 0, 0]), 164.0)
+        self.assertTrue(all(not layers for layers in session.native_sources.values()))
+
     def test_signal_selection_keeps_only_requested_heads(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "heads.json"

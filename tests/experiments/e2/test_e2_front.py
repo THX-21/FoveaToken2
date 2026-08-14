@@ -2,19 +2,35 @@ import unittest
 
 import torch
 
+from experiments.e2.conditions import CONDITIONS
 from experiments.e2.front import BlockFront, stable_seed
 
 
 class BlockFrontTest(unittest.TestCase):
+    def test_e2_registers_twenty_conditions_with_four_native_variants(self):
+        names = {condition.name for condition in CONDITIONS}
+        self.assertEqual(len(CONDITIONS), 20)
+        self.assertTrue(
+            {
+                "native_uniform4",
+                "native_uniform16",
+                "random_fixed_native",
+                "random_perstep_native",
+            }.issubset(names)
+        )
+
     def test_uniform_fronts_cover_grid_and_pool_means(self):
         values = torch.arange(64, dtype=torch.float32)
         two = BlockFront.uniform(8, 8, 2)
         four = BlockFront.uniform(8, 8, 4)
+        eight = BlockFront.uniform(8, 8, 8)
 
         self.assertEqual(two.node_count, 16)
         self.assertEqual(four.node_count, 4)
+        self.assertEqual(eight.node_count, 1)
         self.assertAlmostEqual(float(two.pool(values, 0)[0]), 4.5)
         self.assertAlmostEqual(float(four.pool(values, 0)[0]), 13.5)
+        self.assertAlmostEqual(float(eight.pool(values, 0)[0]), 31.5)
 
     def test_random_front_is_reproducible_and_preserves_scale_counts(self):
         first = BlockFront.random_multiscale(20, 20, stable_seed(42, "sample"))

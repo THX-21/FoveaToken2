@@ -67,9 +67,48 @@ class FoveaSession:
         self._decode_text_indices: dict[tuple[torch.device, int], torch.Tensor] = {}
         self._decode_active_ids: torch.Tensor | None = None
         self._decode_anchor_positions: dict[torch.device, torch.Tensor] = {}
+        self.native_capture_scale: int | None = None
+        self.native_capture_visual_positions: list[int] = []
+        self.native_capture_grids: tuple[tuple[int, int], ...] = ()
+        self.native_sources: dict[
+            int,
+            dict[int, tuple[torch.Tensor, torch.Tensor, tuple[tuple[int, int], ...]]],
+        ] = {}
+        self.native_preparing = False
 
     def reset_prompt(self) -> None:
         """Discard all state owned by the previous prompt."""
+        self._reset_state()
+
+    def begin_native_sample(self) -> None:
+        """Reset the prompt and accept auxiliary native-resolution prefills."""
+        if self.config.pooling_mode != "native_multiscale":
+            raise RuntimeError("native sample preparation requires native_multiscale pooling")
+        self._reset_state()
+        self.native_preparing = True
+
+    def begin_native_capture(self, area_scale: int) -> None:
+        if not self.native_preparing:
+            raise RuntimeError("call begin_native_sample() before auxiliary native prefills")
+        if area_scale not in {4, 16, 64}:
+            raise ValueError("auxiliary native scale must be 4, 16, or 64")
+        if self.native_capture_scale is not None:
+            raise RuntimeError("a native scale capture is already active")
+        self.native_capture_scale = area_scale
+        self.native_capture_visual_positions = []
+        self.native_capture_grids = ()
+        self.native_sources[area_scale] = {}
+
+    def end_native_capture(self) -> None:
+        if self.native_capture_scale is None:
+            raise RuntimeError("no native scale capture is active")
+        if set(self.native_sources[self.native_capture_scale]) != set(self.routed_layers):
+            raise RuntimeError("native auxiliary prefill did not capture every routed layer")
+        self.native_capture_scale = None
+        self.native_capture_visual_positions = []
+        self.native_capture_grids = ()
+
+    def abort_native_sample(self) -> None:
         self._reset_state()
 
     def attach(
@@ -91,7 +130,7 @@ class FoveaSession:
 
     @property
     def is_configured(self) -> bool:
-        return self.forest is not None
+        return self.forest is not None or self.native_capture_scale is not None
 
     @property
     def enabled(self) -> bool:
@@ -102,9 +141,15 @@ class FoveaSession:
         return self.config.mode == "dynamic"
 
     def needs_signal(self, layer_idx: int) -> bool:
-        return self.dynamic and (self.selected_heads is None or layer_idx in self.selected_heads)
+        return (
+            self.native_capture_scale is None
+            and self.dynamic
+            and (self.selected_heads is None or layer_idx in self.selected_heads)
+        )
 
     def is_prefill_layer(self, layer_idx: int) -> bool:
+        if self.native_capture_scale is not None:
+            return layer_idx not in self.native_sources[self.native_capture_scale]
         return layer_idx not in self.pyramids
 
     @staticmethod
@@ -133,7 +178,10 @@ class FoveaSession:
     ) -> None:
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("TokenFovea requires batch_size=1")
+        native_sources = self.native_sources if self.native_preparing else {}
         self._reset_state()
+        if native_sources:
+            self.native_sources = native_sources
         token_ids = input_ids[0].detach().cpu().tolist()
         self.visual_positions = [i for i, token_id in enumerate(token_ids) if token_id == image_token_id]
         visual_set = set(self.visual_positions)
@@ -150,14 +198,49 @@ class FoveaSession:
             raise ValueError(
                 f"processor produced {len(self.visual_positions)} image tokens but grid describes {expected}"
             )
-        self.forest = VisualTokenForest.from_grids(grids)
+        self.forest = (
+            VisualTokenForest.from_aligned_grids(grids, max_block_size=8)
+            if self.config.pooling_mode == "native_multiscale"
+            else VisualTokenForest.from_grids(grids)
+        )
         self.prompt_length = input_ids.shape[1]
+        if self.config.pooling_mode == "native_multiscale":
+            if set(self.native_sources) != {4, 16, 64}:
+                raise RuntimeError("native_multiscale requires prepared scale 4/16/64 banks")
+            self.native_preparing = False
+
+    def configure_native_capture_prompt(
+        self,
+        input_ids: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        image_token_id: int,
+        spatial_merge_size: int,
+    ) -> None:
+        if self.native_capture_scale is None:
+            raise RuntimeError("native capture scale is not active")
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("TokenFovea requires batch_size=1")
+        grids = []
+        for temporal, height, width in image_grid_thw.detach().cpu().tolist():
+            if int(temporal) != 1:
+                raise ValueError("TokenFovea native multiscale supports images only")
+            if int(height) % spatial_merge_size or int(width) % spatial_merge_size:
+                raise ValueError("vision grid is not divisible by spatial_merge_size")
+            grids.append((int(height) // spatial_merge_size, int(width) // spatial_merge_size))
+        tokens = input_ids[0].detach().cpu().tolist()
+        positions = [index for index, token in enumerate(tokens) if token == image_token_id]
+        if len(positions) != sum(h * w for h, w in grids):
+            raise ValueError("native auxiliary visual token count does not match its grids")
+        self.native_capture_visual_positions = positions
+        self.native_capture_grids = tuple(grids)
 
     @staticmethod
     def _index(values: list[int], device: torch.device) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.long, device=device)
 
     def visual_index(self, device: torch.device) -> torch.Tensor:
+        if self.native_capture_scale is not None:
+            return self._index(self.native_capture_visual_positions, device)
         device = torch.device(device)
         index = self._visual_indices.get(device)
         if index is None:
@@ -211,12 +294,38 @@ class FoveaSession:
         hidden_states: torch.Tensor | None = None,
         projector: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> None:
+        if self.native_capture_scale is not None:
+            visual_index = self.visual_index(raw_keys.device)
+            self.native_sources[self.native_capture_scale][layer_idx] = (
+                raw_keys.index_select(-2, visual_index).detach(),
+                values.index_select(-2, visual_index).detach(),
+                self.native_capture_grids,
+            )
+            return
         if self.forest is None or self.fine_position_ids is None:
             return
         topology = self._ensure_device_state(raw_keys.device)
         visual_index = self.visual_index(raw_keys.device)
         fine_positions = self.fine_position_ids.to(device=raw_keys.device, dtype=torch.float32)
-        if self.config.pooling_mode == "hidden":
+        if self.config.pooling_mode == "native_multiscale":
+            fine_raw = raw_keys.index_select(-2, visual_index).detach()
+            fine_values = values.index_select(-2, visual_index).detach()
+            scale_sources = {
+                1: (fine_raw, fine_values, self.forest.grids),
+                **{
+                    scale: self.native_sources[scale][layer_idx]
+                    for scale in (4, 16, 64)
+                },
+            }
+            self.pyramids[layer_idx] = LayerKVPyramid.from_native_scales(
+                topology,
+                self.forest,
+                scale_sources,
+                fine_positions,
+            )
+            for scale in (4, 16, 64):
+                del self.native_sources[scale][layer_idx]
+        elif self.config.pooling_mode == "hidden":
             if hidden_states is None or projector is None:
                 raise RuntimeError("hidden pooling requires hidden states and a KV projector")
             fine_hidden = hidden_states.index_select(1, visual_index)

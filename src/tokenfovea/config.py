@@ -11,7 +11,7 @@ class FoveaConfig:
     budget: int = 1024
     mode: Literal["dynamic", "uniform", "full"] = "dynamic"
     position_mode: Literal["native_center", "text_anchor", "no_rope", "post_rope_pool"] = "native_center"
-    pooling_mode: Literal["kv", "hidden"] = "kv"
+    pooling_mode: Literal["kv", "hidden", "native_multiscale"] = "kv"
     signal_selection: str | None = None
     signal_aggregation: Literal["mean", "max"] = "mean"
     anchor_window: float = 8.0
@@ -27,12 +27,14 @@ class FoveaConfig:
             raise ValueError(f"unsupported mode: {self.mode}")
         if self.position_mode not in {"native_center", "text_anchor", "no_rope", "post_rope_pool"}:
             raise ValueError(f"unsupported position_mode: {self.position_mode}")
-        if self.pooling_mode not in {"kv", "hidden"}:
+        if self.pooling_mode not in {"kv", "hidden", "native_multiscale"}:
             raise ValueError(f"unsupported pooling_mode: {self.pooling_mode}")
         if self.signal_aggregation not in {"mean", "max"}:
             raise ValueError(f"unsupported signal_aggregation: {self.signal_aggregation}")
         if self.pooling_mode == "hidden" and self.position_mode == "post_rope_pool":
             raise ValueError("hidden pooling cannot be combined with post_rope_pool")
+        if self.pooling_mode == "native_multiscale" and self.position_mode != "native_center":
+            raise ValueError("native_multiscale requires position_mode='native_center'")
         if self.anchor_window <= 0:
             raise ValueError("anchor_window must be positive")
         if self.budget <= 0:

@@ -130,17 +130,31 @@ def _generate(
     else:
         plan = high
     prepared_image = resize(image, plan)
-    messages = _messages(lm, prepared_image, prompt)
-    text = _chat_template(lm, messages, model_name)
-    inputs = lm.processor(
-        text=[text], images=[prepared_image], do_resize=False, return_tensors="pt"
-    ).to(lm.device)
-    actual_grid = tuple(int(value) for value in inputs["image_grid_thw"][0].tolist())
-    expected_grid = (1, plan.grid_height * int(lm.model.config.vision_config.spatial_merge_size),
-                     plan.grid_width * int(lm.model.config.vision_config.spatial_merge_size))
-    if actual_grid != expected_grid:
-        raise ValueError(f"processor grid {actual_grid} does not match E2 plan {expected_grid}")
     session.begin_sample(sample_id)
+    if condition.native:
+        try:
+            for divisor, area_scale in ((2, 4), (4, 16)):
+                auxiliary_plan = lowres_plan(high, divisor)
+                auxiliary_inputs = _prepare_inputs(
+                    lm,
+                    model_name,
+                    resize(image, auxiliary_plan),
+                    prompt,
+                    auxiliary_plan,
+                )
+                session.begin_native_capture(area_scale)
+                with torch.inference_mode():
+                    auxiliary_output = lm.model(
+                        **auxiliary_inputs,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                del auxiliary_output
+                session.end_native_capture()
+        except Exception:
+            session.abort_native_sample()
+            raise
+    inputs = _prepare_inputs(lm, model_name, prepared_image, prompt, plan)
     kwargs = {
         "max_new_tokens": min(int(generation_kwargs.get("max_new_tokens", config.max_new_tokens)), config.max_new_tokens),
         "do_sample": False,
@@ -186,6 +200,26 @@ def _generate(
         diagnostics["active_tokens"] = plan.visual_tokens
         diagnostics["compression_ratio"] = plan.visual_tokens / high.visual_tokens
     return answer, diagnostics
+
+
+def _prepare_inputs(
+    lm: Any,
+    model_name: str,
+    image: Image.Image,
+    prompt: str,
+    plan: Any,
+):
+    messages = _messages(lm, image, prompt)
+    text = _chat_template(lm, messages, model_name)
+    inputs = lm.processor(
+        text=[text], images=[image], do_resize=False, return_tensors="pt"
+    ).to(lm.device)
+    actual_grid = tuple(int(value) for value in inputs["image_grid_thw"][0].tolist())
+    merge_size = int(lm.model.config.vision_config.spatial_merge_size)
+    expected_grid = (1, plan.grid_height * merge_size, plan.grid_width * merge_size)
+    if actual_grid != expected_grid:
+        raise ValueError(f"processor grid {actual_grid} does not match E2 plan {expected_grid}")
+    return inputs
 
 
 def _task_manager(model_name: str):

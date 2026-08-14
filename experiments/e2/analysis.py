@@ -14,15 +14,34 @@ LOWRES_BASELINE = {
     "uniform2_kv_center": "lowres_2",
     "uniform2_hidden_center": "lowres_2",
     "uniform2_postrope": "lowres_2",
+    "native_uniform4": "lowres_2",
     "uniform4_kv_center": "lowres_4",
     "uniform4_hidden_center": "lowres_4",
     "uniform4_postrope": "lowres_4",
+    "native_uniform16": "lowres_4",
     "random_fixed_kv_center": "lowres_random_matched",
     "random_fixed_hidden_center": "lowres_random_matched",
     "random_fixed_postrope": "lowres_random_matched",
+    "random_fixed_native": "lowres_random_matched",
     "random_perstep_kv_center": "lowres_random_matched",
     "random_perstep_hidden_center": "lowres_random_matched",
     "random_perstep_postrope": "lowres_random_matched",
+    "random_perstep_native": "lowres_random_matched",
+}
+
+NATIVE_POOLING_BASELINES = {
+    "native_uniform4": (
+        "uniform2_kv_center", "uniform2_hidden_center", "uniform2_postrope"
+    ),
+    "native_uniform16": (
+        "uniform4_kv_center", "uniform4_hidden_center", "uniform4_postrope"
+    ),
+    "random_fixed_native": (
+        "random_fixed_kv_center", "random_fixed_hidden_center", "random_fixed_postrope"
+    ),
+    "random_perstep_native": (
+        "random_perstep_kv_center", "random_perstep_hidden_center", "random_perstep_postrope"
+    ),
 }
 
 
@@ -60,6 +79,7 @@ def analyze(config: E2Config, model_name: str) -> list[dict[str, Any]]:
             agreement = _token_agreement(samples["full"], samples[condition_name], task)
             first_agreement = _first_token_agreement(samples["full"], samples[condition_name], task)
             timing = _mean_timing(samples[condition_name], task)
+            pooling_gains = _native_pooling_gains(results, condition_name, task, score)
             rows.append(
                 {
                     "condition": condition_name,
@@ -71,6 +91,7 @@ def analyze(config: E2Config, model_name: str) -> list[dict[str, Any]]:
                     "full_correct_retention": retention,
                     "token_agreement": agreement,
                     "first_token_agreement": first_agreement,
+                    **pooling_gains,
                     **timing,
                 }
             )
@@ -88,8 +109,16 @@ def analyze(config: E2Config, model_name: str) -> list[dict[str, Any]]:
                 "full_correct_retention": None,
                 "token_agreement": None,
                 "first_token_agreement": None,
+                **_native_pooling_gains(
+                    results,
+                    condition_name,
+                    None,
+                    float(result["macro_average"]),
+                ),
                 "prefill_seconds": None,
                 "decode_seconds": None,
+                "native_prefill_seconds": None,
+                "native_bank_tokens": None,
                 "total_seconds": None,
             }
         )
@@ -148,16 +177,41 @@ def _first_token_agreement(full: dict[str, Any], current: dict[str, Any], task: 
 
 def _mean_timing(samples: dict[str, Any], task: str) -> dict[str, float | None]:
     rows = [row for row in samples.values() if row["task"] == task]
-    return {
-        name: sum(float(row.get(name, 0)) for row in rows) / len(rows) if rows else None
-        for name in ("prefill_seconds", "decode_seconds", "total_seconds")
-    }
+    result = {}
+    for name in (
+        "prefill_seconds", "decode_seconds", "native_prefill_seconds",
+        "native_bank_tokens", "total_seconds",
+    ):
+        values = [float(row[name]) for row in rows if row.get(name) is not None]
+        result[name] = sum(values) / len(values) if values else None
+    return result
+
+
+def _native_pooling_gains(
+    results: dict[str, Any],
+    condition: str,
+    task: str | None,
+    score: float,
+) -> dict[str, float | None]:
+    names = NATIVE_POOLING_BASELINES.get(condition, ())
+    labels = ("gain_kv_pooling", "gain_hidden_pooling", "gain_postrope_pooling")
+    gains: dict[str, float | None] = {label: None for label in labels}
+    for label, baseline in zip(labels, names):
+        if baseline not in results:
+            continue
+        baseline_score = (
+            float(results[baseline]["macro_average"])
+            if task is None
+            else float(results[baseline]["tasks"][task]["primary_score"])
+        )
+        gains[label] = score - baseline_score
+    return gains
 
 
 def _validate_sample_rows(condition: str, samples: dict[str, dict[str, Any]]) -> None:
     for sample_id, row in samples.items():
-        for name in ("prefill_seconds", "decode_seconds", "total_seconds"):
-            value = float(row.get(name, 0))
+        for name in ("prefill_seconds", "decode_seconds", "native_prefill_seconds", "total_seconds"):
+            value = float(row.get(name, 0) or 0)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"invalid {name} for {condition}/{sample_id}")
         if condition in {"lowres_2", "lowres_4"} and int(row.get("token_count_delta", 0)) != 0:

@@ -100,14 +100,28 @@ def install_tokenfovea(model: torch.nn.Module, session: FoveaSession) -> PatchHa
         )
         if not new_prompt:
             return
-        session.reset_prompt()
         if not session.enabled:
+            session.reset_prompt()
             return
         if video_grid is not None:
             raise ValueError("TokenFovea currently supports images only")
         if image_grid is not None:
             if input_ids is None:
                 raise ValueError("TokenFovea image prompts require input_ids")
+            if session.native_capture_scale is not None:
+                session.configure_native_capture_prompt(
+                    input_ids,
+                    image_grid,
+                    image_token_id,
+                    spatial_merge_size,
+                )
+                return
+            if session.config.pooling_mode == "native_multiscale" and not session.native_preparing:
+                raise RuntimeError(
+                    "native_multiscale inputs were not prepared before the main prompt"
+                )
+            if session.config.pooling_mode != "native_multiscale":
+                session.reset_prompt()
             session.configure_prompt(input_ids, image_grid, image_token_id, spatial_merge_size)
 
     def language_pre_hook(_module, args, kwargs):

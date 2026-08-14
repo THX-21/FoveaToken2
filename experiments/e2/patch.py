@@ -85,9 +85,16 @@ def install_e2(model: torch.nn.Module, session: E2Session) -> E2PatchHandle:
             if grid is not None:
                 if not session.pending_sample_id:
                     raise RuntimeError("call E2Session.begin_sample() before model.generate()")
-                session.configure_prompt(
-                    session.pending_sample_id, input_ids, grid, image_token_id, spatial_merge_size
-                )
+                if session.native_capture_scale is not None:
+                    session.configure_native_capture_prompt(
+                        input_ids, grid, image_token_id, spatial_merge_size
+                    )
+                else:
+                    if session.condition.native and not session.native_preparing:
+                        raise RuntimeError("native E2 inputs were not prepared")
+                    session.configure_prompt(
+                        session.pending_sample_id, input_ids, grid, image_token_id, spatial_merge_size
+                    )
         session.start_forward()
 
     def model_post_hook(_module, _args, _kwargs, output):

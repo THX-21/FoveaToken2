@@ -7,6 +7,26 @@ from tokenfovea.topology import DeviceTreeTopology, VisualTokenForest
 
 
 class PyramidTest(unittest.TestCase):
+    def test_native_scales_map_to_exact_tree_nodes(self):
+        forest = VisualTokenForest.from_aligned_grids([(8, 8)])
+        topology = DeviceTreeTopology.build(forest, torch.device("cpu"))
+        sources = {}
+        for area, edge in ((1, 1), (4, 2), (16, 4), (64, 8)):
+            count = (8 // edge) ** 2
+            keys = torch.full((1, 1, count, 1), float(area))
+            values = keys + 100
+            sources[area] = (keys, values, ((8 // edge, 8 // edge),))
+        positions = torch.arange(64, dtype=torch.float32).view(1, 1, 64).expand(3, -1, -1)
+
+        pyramid = LayerKVPyramid.from_native_scales(
+            topology, forest, sources, positions
+        )
+
+        for node in forest.nodes:
+            edge = node.y1 - node.y0
+            self.assertEqual(float(pyramid.raw_keys[0, 0, node.node_id, 0]), float(edge * edge))
+            self.assertEqual(float(pyramid.values[0, 0, node.node_id, 0]), float(edge * edge + 100))
+
     def test_levelwise_pyramid_matches_leaf_means(self):
         forest = VisualTokenForest.from_grids([(3, 5)])
         topology = DeviceTreeTopology.build(forest, torch.device("cpu"))

@@ -41,8 +41,8 @@ class BlockFront:
     @classmethod
     def uniform(cls, height: int, width: int, block_size: int) -> "BlockFront":
         _validate_grid(height, width)
-        if block_size not in {1, 2, 4}:
-            raise ValueError("block_size must be 1, 2, or 4")
+        if block_size not in {1, 2, 4, 8}:
+            raise ValueError("block_size must be 1, 2, 4, or 8")
         if height % block_size or width % block_size:
             raise ValueError("grid is not divisible by block_size")
         nodes = tuple(
@@ -90,7 +90,7 @@ class BlockFront:
         if len(covered) != self.leaf_count or sorted(covered) != list(range(self.leaf_count)):
             raise ValueError("front nodes must form a non-overlapping cover of the visual grid")
         for node in self.nodes:
-            if node.size not in {1, 2, 4} or len(node.leaves) != node.size**2:
+            if node.size not in {1, 2, 4, 8} or len(node.leaves) != node.size**2:
                 raise ValueError("front contains an invalid block node")
 
     def pool(self, fine: torch.Tensor, node_dim: int) -> torch.Tensor:
