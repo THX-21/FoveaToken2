@@ -18,8 +18,13 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             FoveaConfig(pooling_mode="hidden", position_mode="post_rope_pool")
         with self.assertRaises(ValueError):
-            FoveaConfig(pooling_mode="native_multiscale", position_mode="text_anchor")
+            FoveaConfig(pooling_mode="native_multiscale", position_mode="post_rope_pool")
 
-    def test_accepts_native_multiscale_with_native_center(self):
-        config = FoveaConfig(pooling_mode="native_multiscale")
-        self.assertEqual(config.pooling_mode, "native_multiscale")
+    def test_accepts_native_multiscale_position_modes(self):
+        for position_mode in ("native_center", "text_anchor", "no_rope"):
+            with self.subTest(position_mode=position_mode):
+                config = FoveaConfig(
+                    pooling_mode="native_multiscale",
+                    position_mode=position_mode,
+                )
+                self.assertEqual(config.position_mode, position_mode)

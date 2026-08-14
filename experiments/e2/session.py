@@ -140,6 +140,10 @@ class E2Session:
     def configured(self) -> bool:
         return bool(self.visual_positions) or self.native_capture_scale is not None
 
+    @property
+    def preserve_prefill(self) -> bool:
+        return self.condition.front_mode == "random_perstep"
+
     def attach(
         self,
         layers: list[int],

@@ -51,8 +51,8 @@ Main arguments:
 Current constraints for routed modes: image input only, batch size one, `num_beams=1`, and `use_cache=true`. The full multi-scale KV pyramid still occupies memory proportional to the original visual-token count. If `fovea_budget` is greater than or equal to the processed visual-token count, the front contains all leaf nodes and no spatial compression occurs.
 
 `native_multiscale` replaces pooled parent K/V with K/V captured from native `/2`, `/4`, and `/8`
-image prefills (area scales 4, 16, and 64). It requires `position_mode=native_center`, aligns each
-LLM visual grid to a multiple of eight, and adds three auxiliary prefills per sample. The auxiliary
+image prefills (area scales 4, 16, and 64). It supports `native_center`, `text_anchor`, and `no_rope`,
+aligns each LLM visual grid to a multiple of eight, and adds three auxiliary prefills per sample. The auxiliary
 caches are discarded, while the per-layer native visual bank and the original generation cache are
 retained. This mode validates native multiscale representation quality; it is not yet a prefill or
 memory optimization.
@@ -81,3 +81,9 @@ then exports Top-4/8/16 `head_selection.json` candidates and an HTML report. See
 The independent E2 module compares uniform and random multiscale visual pooling, native multiscale K/V,
 and token-matched low-resolution inputs on four lmms-eval Lite tasks. See
 [`experiments/e2/README.md`](experiments/e2/README.md).
+
+## E3 Text-Anchor position encoding
+
+E3 pairs four fixed visual representations with normal position encoding and decode-only
+`text_anchor`, using a bounded `Analyze`/`Answer` response format. See
+[`experiments/e3/README.md`](experiments/e3/README.md).

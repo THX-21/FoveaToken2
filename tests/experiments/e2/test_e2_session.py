@@ -16,6 +16,10 @@ def _encoder(reference, positions):
 
 
 class E2SessionTest(unittest.TestCase):
+    def test_only_perstep_conditions_preserve_full_prefill(self):
+        self.assertTrue(E2Session(get_condition("random_perstep_kv_center")).preserve_prefill)
+        self.assertFalse(E2Session(get_condition("random_fixed_kv_center")).preserve_prefill)
+
     def test_native_auxiliary_banks_feed_uniform_front(self):
         session = E2Session(get_condition("native_uniform4"))
         session.attach([0], _encoder, "qwen2_5_vl")

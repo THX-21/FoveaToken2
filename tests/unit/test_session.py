@@ -10,9 +10,14 @@ from tokenfovea.session import FoveaSession
 
 
 class SessionTest(unittest.TestCase):
-    def test_native_multiscale_auxiliary_lifecycle_and_scale64_root(self):
+    def test_native_multiscale_text_anchor_lifecycle_and_scale64_root(self):
         session = FoveaSession(
-            FoveaConfig(mode="uniform", budget=1, pooling_mode="native_multiscale")
+            FoveaConfig(
+                mode="uniform",
+                budget=1,
+                pooling_mode="native_multiscale",
+                position_mode="text_anchor",
+            )
         )
         session.attach(
             [0],

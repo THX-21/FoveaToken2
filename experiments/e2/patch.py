@@ -152,7 +152,7 @@ def _qwen25_forward(original, session: E2Session):
                     values = module.v_proj(nodes).view(batch, count, -1, module.head_dim).transpose(1, 2)
                     return keys, values
             session.capture_layer(module.layer_idx, raw_key, value, rotated_key, hidden_states, projector)
-            if session.condition.front_mode == "random_perstep":
+            if session.preserve_prefill:
                 return original(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -229,7 +229,7 @@ def _qwen35_forward(original, session: E2Session):
                     values = module.v_proj(nodes).view(nodes.shape[0], count, -1, module.head_dim).transpose(1, 2)
                     return keys, values
             session.capture_layer(module.layer_idx, raw_key, value, rotated_key, hidden_states, projector)
-            if session.condition.front_mode == "random_perstep":
+            if session.preserve_prefill:
                 return original(
                     hidden_states,
                     position_embeddings=position_embeddings,

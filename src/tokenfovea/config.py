@@ -33,8 +33,8 @@ class FoveaConfig:
             raise ValueError(f"unsupported signal_aggregation: {self.signal_aggregation}")
         if self.pooling_mode == "hidden" and self.position_mode == "post_rope_pool":
             raise ValueError("hidden pooling cannot be combined with post_rope_pool")
-        if self.pooling_mode == "native_multiscale" and self.position_mode != "native_center":
-            raise ValueError("native_multiscale requires position_mode='native_center'")
+        if self.pooling_mode == "native_multiscale" and self.position_mode == "post_rope_pool":
+            raise ValueError("native_multiscale cannot be combined with post_rope_pool")
         if self.anchor_window <= 0:
             raise ValueError("anchor_window must be positive")
         if self.budget <= 0:
