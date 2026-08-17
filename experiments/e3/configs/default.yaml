@@ -19,6 +19,6 @@ models:
     pixel_per_token: 28
   qwen35:
     pretrained: Qwen/Qwen3.5-9B
-    min_pixels: 65536
-    max_pixels: 131072
+    min_pixels: 200704
+    max_pixels: 1605632
     pixel_per_token: 32

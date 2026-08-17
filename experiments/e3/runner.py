@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from experiments.distributed import distributed_context
 from experiments.e2.evaluator import load_tasks
 from experiments.e2.runner import load_lm
 
@@ -31,40 +32,45 @@ def run(
     condition_name: str | None = None,
     scoring_version: str = SCORING_VERSION,
 ) -> Path:
+    distributed = distributed_context()
     if model_name not in config.models:
         raise ValueError(f"unknown model {model_name!r}")
     judge_enabled, judge_model, judge_max_tokens, judge_thinking = llm_judge_status()
-    if judge_enabled:
+    if judge_enabled and distributed.is_main:
         print(
             "E3 LLM Judge: enabled "
             f"(model={judge_model}, max_tokens={judge_max_tokens}, thinking={judge_thinking}; "
             "triggers on invalid format or rule-score mismatch)."
         )
-    else:
+    elif distributed.is_main:
         print("E3 LLM Judge: disabled.")
-    prepare_data(config)
+    if distributed.is_main:
+        prepare_data(config)
+    distributed.barrier()
     requested = [get_condition(condition_name)] if condition_name else list(CONDITIONS)
     versions = _dependency_versions()
     output_dir = config.output_dir / model_name
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "run_manifest.json"
     manifest = _manifest(config, model_name, requested, versions)
-    if manifest_path.exists():
-        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if previous.get("version") != RUN_PROTOCOL_VERSION:
-            raise ValueError(
-                f"{output_dir} uses E3 result protocol {previous.get('version')!r}; "
-                "move or remove it before rerunning"
-            )
-        if previous.get("prompt_version") != PROMPT_VERSION:
-            raise ValueError(
-                f"{output_dir} uses E3 prompt version {previous.get('prompt_version')!r}; "
-                "move or remove it before rerunning"
-            )
-        manifest["completed_conditions"] = list(previous.get("completed_conditions", []))
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    if distributed.is_main:
+        if manifest_path.exists():
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if previous.get("version") != RUN_PROTOCOL_VERSION:
+                raise ValueError(
+                    f"{output_dir} uses E3 result protocol {previous.get('version')!r}; "
+                    "move or remove it before rerunning"
+                )
+            if previous.get("prompt_version") != PROMPT_VERSION:
+                raise ValueError(
+                    f"{output_dir} uses E3 prompt version {previous.get('prompt_version')!r}; "
+                    "move or remove it before rerunning"
+                )
+            manifest["completed_conditions"] = list(previous.get("completed_conditions", []))
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    distributed.barrier()
     spec = config.models[model_name]
     lm = load_lm(spec, model_name)
     tasks = load_tasks(model_name, config.tasks)
@@ -79,11 +85,13 @@ def run(
             tasks,
             scoring_version=scoring_version,
         )
-        if condition.name not in manifest["completed_conditions"]:
-            manifest["completed_conditions"].append(condition.name)
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        if distributed.is_main:
+            if condition.name not in manifest["completed_conditions"]:
+                manifest["completed_conditions"].append(condition.name)
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        distributed.barrier()
     return output_dir
 
 
@@ -96,6 +104,11 @@ def reevaluate(
     restart: bool = False,
     workers: int = 8,
 ) -> Path:
+    distributed = distributed_context()
+    if distributed.enabled:
+        raise RuntimeError(
+            "E3 reevaluate is CPU/API work; run it with plain python, not torchrun"
+        )
     if model_name not in config.models:
         raise ValueError(f"unknown model {model_name!r}")
     if workers <= 0:

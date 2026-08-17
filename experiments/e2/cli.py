@@ -23,7 +23,7 @@ def main(argv: list[str] | None = None) -> None:
         if command == "run":
             child.add_argument("--condition")
     args = parser.parse_args(argv)
-    if args.thinking and args.model != "qwen35":
+    if args.command != "prepare" and args.thinking and args.model != "qwen35":
         parser.error("--thinking is only supported for qwen35")
     config = E2Config.load(args.config)
     if args.command == "prepare":

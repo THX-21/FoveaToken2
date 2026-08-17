@@ -29,5 +29,20 @@ python -m experiments.e3 analyze --model qwen25
 python -m experiments.e3 report --model qwen25
 ```
 
+To split the samples within each condition across four GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
+  -m experiments.e3 run --model qwen35
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
+  -m experiments.e3 run --model qwen35 --condition full_text_anchor
+```
+
+Conditions are not assigned to different GPUs. Each condition is processed by all workers, with
+its sample list sharded across ranks, then rank 0 merges and scores the complete result. Generation
+is resumable. `reevaluate` is CPU/API concurrency and should continue to use plain `python` with
+its `--workers` option.
+
 Outputs are written to `outputs/e3/<model>/`. The full matrix contains 6,400 sample generations
 across both models. Native2 captures only the `/2` auxiliary visual K/V bank.

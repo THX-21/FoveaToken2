@@ -437,3 +437,62 @@ def _decode_gaze_totals(payload: dict[str, dict[str, Any]]) -> dict[tuple[int, i
             "null_count": values["null_count"],
         }
     return decoded
+
+
+def checkpoint_sample_ids(paths: list[Path]) -> set[str]:
+    completed: set[str] = set()
+    for path in paths:
+        if not path.exists():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        completed.update(str(value) for value in payload.get("completed_sample_ids", []))
+    return completed
+
+
+def merge_probe_checkpoints(paths: list[Path], destination: Path) -> int:
+    """Merge disjoint rank-local E1 accumulators into one resumable checkpoint."""
+
+    completed: set[str] = set()
+    natural_totals: dict[tuple[int, int], dict[str, float]] = {}
+    gaze_totals: dict[tuple[int, int], dict[str, Any]] = {}
+    sample_counts = {"natural": 0, "gaze": 0, "null": 0}
+    for path in paths:
+        if not path.exists():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        path_ids = set(str(value) for value in payload.get("completed_sample_ids", []))
+        overlap = completed.intersection(path_ids)
+        if overlap:
+            example = sorted(overlap)[0]
+            raise ValueError(f"duplicate E1 sample {example!r} across rank checkpoints")
+        completed.update(path_ids)
+        for key, values in _decode_totals(payload.get("natural_totals", {})).items():
+            target = natural_totals.setdefault(key, {})
+            for name, value in values.items():
+                target[name] = target.get(name, 0.0) + float(value)
+        for key, values in _decode_gaze_totals(payload.get("gaze_totals", {})).items():
+            target = gaze_totals.setdefault(
+                key,
+                {
+                    "matrix": torch.zeros(9, 9, dtype=torch.float64),
+                    "matrix_count": torch.zeros(9, dtype=torch.int64),
+                    "null": torch.zeros(9, dtype=torch.float64),
+                    "null_count": 0,
+                },
+            )
+            target["matrix"] += values["matrix"]
+            target["matrix_count"] += values["matrix_count"]
+            target["null"] += values["null"]
+            target["null_count"] += int(values["null_count"])
+        for name in sample_counts:
+            sample_counts[name] += int(payload.get("sample_counts", {}).get(name, 0))
+    _write_json(
+        destination,
+        {
+            "completed_sample_ids": sorted(completed),
+            "natural_totals": _encode_totals(natural_totals),
+            "gaze_totals": _encode_gaze_totals(gaze_totals),
+            "sample_counts": sample_counts,
+        },
+    )
+    return len(completed)

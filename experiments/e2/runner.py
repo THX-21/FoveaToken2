@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from experiments.distributed import distributed_context
+
 from .conditions import CONDITIONS, Condition, get_condition
 from .config import E2Config, ModelSpec, as_dict
 from .data import prepare_data
@@ -23,33 +25,44 @@ def run(
     condition_name: str | None = None,
     thinking: bool = False,
 ) -> Path:
+    distributed = distributed_context()
     if model_name not in config.models:
         raise ValueError(f"unknown model {model_name!r}")
     if thinking and model_name != "qwen35":
         raise ValueError("thinking is only supported for qwen35")
-    prepare_data(config)
+    if distributed.is_main:
+        prepare_data(config)
+    distributed.barrier()
     spec = config.models[model_name]
     output_dir = config.output_dir / run_name(model_name, thinking)
     output_dir.mkdir(parents=True, exist_ok=True)
     conditions = [get_condition(condition_name)] if condition_name else list(CONDITIONS)
     manifest_path = output_dir / "run_manifest.json"
     manifest = _manifest(config, model_name, spec, conditions, thinking)
-    if manifest_path.exists():
-        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if previous.get("version") != RUN_PROTOCOL_VERSION:
-            raise ValueError(
-                f"{output_dir} uses E2 result protocol {previous.get('version')!r}; "
-                "move or remove it before rerunning with the corrected task prompts"
-            )
-        manifest["completed_conditions"] = list(previous.get("completed_conditions", []))
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    if distributed.is_main:
+        if manifest_path.exists():
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if previous.get("version") != RUN_PROTOCOL_VERSION:
+                raise ValueError(
+                    f"{output_dir} uses E2 result protocol {previous.get('version')!r}; "
+                    "move or remove it before rerunning with the corrected task prompts"
+                )
+            manifest["completed_conditions"] = list(previous.get("completed_conditions", []))
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    distributed.barrier()
     lm = load_lm(spec, model_name, thinking=thinking)
     tasks = load_tasks(model_name, config.tasks)
     for condition in conditions:
         evaluate_condition(config, model_name, spec, condition, lm, output_dir, tasks, thinking=thinking)
-        if condition.name not in manifest["completed_conditions"]:
-            manifest["completed_conditions"].append(condition.name)
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        if distributed.is_main:
+            if condition.name not in manifest["completed_conditions"]:
+                manifest["completed_conditions"].append(condition.name)
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        distributed.barrier()
     return output_dir
 
 
@@ -58,6 +71,8 @@ def run_name(model_name: str, thinking: bool = False) -> str:
 
 
 def load_lm(spec: ModelSpec, model_name: str, *, thinking: bool = False) -> Any:
+    distributed = distributed_context()
+    device = distributed.device if distributed.enabled else DEVICE
     try:
         if model_name == "qwen25":
             from transformers import AutoProcessor
@@ -71,8 +86,8 @@ def load_lm(spec: ModelSpec, model_name: str, *, thinking: bool = False) -> Any:
         lm = cls(
             pretrained=spec.pretrained,
             batch_size=1,
-            device=DEVICE,
-            device_map=DEVICE,
+            device=device,
+            device_map=device,
             use_cache=True,
             attn_implementation="sdpa",
             min_pixels=spec.min_pixels,

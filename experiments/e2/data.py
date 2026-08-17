@@ -5,6 +5,8 @@ import random
 from pathlib import Path
 from typing import Any
 
+from experiments.local_datasets import load_lite_config
+
 from .config import E2Config
 
 DATASETS = {
@@ -20,17 +22,13 @@ def prepare_data(config: E2Config, *, force: bool = False) -> Path:
     if manifest_path.exists() and not force:
         validate_manifest(config, json.loads(manifest_path.read_text(encoding="utf-8")))
         return manifest_path
-    from datasets import load_dataset  # type: ignore[import-untyped]
-
     config.data_dir.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {"version": 1, "seed": config.seed, "tasks": {}}
     for task in config.tasks:
         if task not in DATASETS:
             raise ValueError(f"unsupported E2 task {task!r}")
         dataset_name, split = DATASETS[task]
-        dataset = load_dataset(
-            "lmms-lab-encoder/LMMs-Eval-Lite", dataset_name, split=split, token=True
-        )
+        dataset = load_lite_config(dataset_name)
         if len(dataset) < config.sample_count:
             raise ValueError(f"{task} only has {len(dataset)} rows")
         rng = random.Random(f"{config.seed}:{task}")

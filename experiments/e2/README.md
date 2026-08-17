@@ -49,6 +49,20 @@ python -m experiments.e2 run --model qwen25 --condition random_fixed_native
 python -m experiments.e2 run --model qwen25 --condition random_perstep_native
 ```
 
+To split the samples within each condition across four GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
+  -m experiments.e2 run --model qwen25
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
+  -m experiments.e2 run --model qwen25 --condition random_perstep_native
+```
+
+Every rank loads one model on its own GPU. Conditions still run in the configured order; only the
+samples inside the current condition are sharded. Rank-local JSONL files are merged by rank 0 and
+the normal restart behavior is preserved.
+
 Qwen3.5 thinking is off by default. Enable it with a 2048-token generation limit:
 
 ```bash
@@ -67,5 +81,5 @@ CUDA_VISIBLE_DEVICES=0 python -m experiments.e2 run --model qwen25
 ```
 
 E2 uses the Qwen2.5 slow image processor to keep visual tokenization stable across Transformers releases.
-E2 uses one GPU only. By default it uses the first visible GPU; choose a physical GPU with, for example,
+With plain `python`, E2 uses the first visible GPU; choose one with, for example,
 `CUDA_VISIBLE_DEVICES=0 python -m experiments.e2 run --model qwen25`.

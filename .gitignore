@@ -15,3 +15,5 @@ traces/
 agent.md
 uv.lock
 *.pdf
+Qwen/*
+lmms-lab-encoder/*

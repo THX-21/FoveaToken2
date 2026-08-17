@@ -9,6 +9,13 @@ import torch
 from PIL import Image
 from tqdm import tqdm  # type: ignore[import-untyped]
 
+from experiments.distributed import (
+    distributed_context,
+    merge_rank_jsonl,
+    merge_rank_text,
+)
+from experiments.local_datasets import use_local_lmms_datasets
+
 from .conditions import Condition
 from .config import E2Config, ModelSpec
 from .data import source_indices
@@ -29,12 +36,16 @@ def evaluate_condition(
     *,
     thinking: bool = False,
 ) -> dict[str, Any]:
+    distributed = distributed_context()
     condition_dir = output_dir / condition.name
     condition_dir.mkdir(parents=True, exist_ok=True)
     result_path = condition_dir / "results.json"
     sample_path = condition_dir / "samples.jsonl"
-    if result_path.exists() and sample_path.exists():
-        return json.loads(result_path.read_text(encoding="utf-8"))
+    trace_path = condition_dir / "front_traces.jsonl"
+    if distributed.is_main:
+        merge_rank_jsonl(sample_path, key="sample_id")
+        merge_rank_text(trace_path)
+    distributed.barrier()
     task_indices = {task_name: source_indices(config, task_name) for task_name in config.tasks}
     expected_sample_ids = {
         f"{task_name}:{source_index}"
@@ -42,40 +53,47 @@ def evaluate_condition(
         for source_index in indices
     }
     completed_samples = _read_completed_samples(sample_path, expected_sample_ids)
-    trace_path = condition_dir / "front_traces.jsonl"
-    if trace_path.exists() and not completed_samples:
+    if result_path.exists() and len(completed_samples) == len(expected_sample_ids):
+        return json.loads(result_path.read_text(encoding="utf-8"))
+    if distributed.is_main and result_path.exists():
+        result_path.unlink()
+    distributed.barrier()
+    if distributed.is_main and trace_path.exists() and not completed_samples:
         trace_path.unlink()
+    distributed.barrier()
+    write_sample_path = (
+        distributed.rank_path(sample_path) if distributed.enabled else sample_path
+    )
+    write_trace_path = (
+        distributed.rank_path(trace_path) if distributed.enabled else trace_path
+    )
     session = E2Session(
         condition,
         seed=config.seed,
         area_ratios=config.area_ratios,
-        trace_path=trace_path if condition.pooled else None,
+        trace_path=write_trace_path if condition.pooled else None,
     )
     patch = install_e2(lm.model, session) if _needs_patch(condition) else None
     try:
         task_manager = _task_manager(model_name) if tasks is None else None
-        task_results: dict[str, Any] = {}
         for task_name in config.tasks:
             task = tasks[task_name] if tasks is not None else _load_task(task_manager, task_name)
             documents = task.eval_docs
             indices = task_indices[task_name]
             sample_ids = [f"{task_name}:{source_index}" for source_index in indices]
-            rows = [completed_samples[sample_id] for sample_id in sample_ids if sample_id in completed_samples]
-            metric_values: dict[str, list[Any]] = {}
-            for record in rows:
-                for name, value in record["metrics"].items():
-                    if isinstance(value, (int, float, bool)):
-                        metric_values.setdefault(name, []).append(value)
             pending_indices = [
                 source_index
                 for source_index, sample_id in zip(indices, sample_ids)
                 if sample_id not in completed_samples
             ]
+            local_indices = distributed.shard(pending_indices)
             for source_index in tqdm(
-                pending_indices,
-                total=len(indices),
-                initial=len(rows),
-                desc=f"{model_name} {condition.name} {task_name}",
+                local_indices,
+                total=len(local_indices),
+                desc=(
+                    f"{model_name} {condition.name} {task_name} "
+                    f"rank {distributed.rank}/{distributed.world_size}"
+                ),
             ):
                 doc = documents[source_index]
                 sample_id = f"{task_name}:{source_index}"
@@ -97,32 +115,81 @@ def evaluate_condition(
                         "metrics": _jsonable(processed),
                     }
                 )
-                rows.append(record)
                 completed_samples[sample_id] = record
-                for name, value in processed.items():
-                    if isinstance(value, (int, float, bool)):
-                        metric_values.setdefault(name, []).append(value)
-                with sample_path.open("a", encoding="utf-8") as stream:
+                with write_sample_path.open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-            metrics = {}
-            aggregators = task.aggregation()
-            for name, values in metric_values.items():
-                aggregator = aggregators.get(name)
-                metrics[name] = float(aggregator(values) if aggregator is not None else sum(values) / len(values))
-            primary = _primary_metric(task_name, metrics)
-            task_results[task_name] = {"metrics": metrics, "primary_score": primary, "samples": len(rows)}
-        payload = {
-            "model": spec.pretrained,
-            "model_alias": model_name,
-            "condition": condition.name,
-            "tasks": task_results,
-            "macro_average": sum(row["primary_score"] for row in task_results.values()) / len(task_results),
-        }
-        result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return payload
+        distributed.barrier()
+        if distributed.is_main:
+            merge_rank_jsonl(sample_path, key="sample_id")
+            merge_rank_text(trace_path)
+            completed = _read_completed_samples(sample_path, expected_sample_ids)
+            payload = _aggregate_condition(
+                config,
+                model_name,
+                spec,
+                condition,
+                tasks,
+                task_manager,
+                task_indices,
+                completed,
+            )
+            result_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        distributed.barrier()
+        return json.loads(result_path.read_text(encoding="utf-8"))
     finally:
         if patch is not None:
             patch.remove()
+
+
+def _aggregate_condition(
+    config: E2Config,
+    model_name: str,
+    spec: ModelSpec,
+    condition: Condition,
+    tasks: dict[str, Any] | None,
+    task_manager: Any,
+    task_indices: dict[str, list[int]],
+    completed: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    task_results: dict[str, Any] = {}
+    for task_name in config.tasks:
+        task = tasks[task_name] if tasks is not None else _load_task(task_manager, task_name)
+        sample_ids = [f"{task_name}:{index}" for index in task_indices[task_name]]
+        missing = [sample_id for sample_id in sample_ids if sample_id not in completed]
+        if missing:
+            raise RuntimeError(
+                f"distributed E2 condition {condition.name} is missing {len(missing)} samples"
+            )
+        rows = [completed[sample_id] for sample_id in sample_ids]
+        metric_values: dict[str, list[Any]] = {}
+        for record in rows:
+            for name, value in record["metrics"].items():
+                if isinstance(value, (int, float, bool)):
+                    metric_values.setdefault(name, []).append(value)
+        aggregators = task.aggregation()
+        metrics = {
+            name: float(
+                aggregators[name](values)
+                if aggregators.get(name) is not None
+                else sum(values) / len(values)
+            )
+            for name, values in metric_values.items()
+        }
+        task_results[task_name] = {
+            "metrics": metrics,
+            "primary_score": _primary_metric(task_name, metrics),
+            "samples": len(rows),
+        }
+    return {
+        "model": spec.pretrained,
+        "model_alias": model_name,
+        "condition": condition.name,
+        "tasks": task_results,
+        "macro_average": sum(row["primary_score"] for row in task_results.values())
+        / len(task_results),
+    }
 
 
 def _read_completed_samples(path: Path, expected_ids: set[str]) -> dict[str, dict[str, Any]]:
@@ -310,8 +377,9 @@ def _load_task(manager: Any, task_name: str) -> Any:
 
 
 def load_tasks(model_name: str, task_names: tuple[str, ...]) -> dict[str, Any]:
-    manager = _task_manager(model_name)
-    return {name: _load_task(manager, name) for name in task_names}
+    with use_local_lmms_datasets():
+        manager = _task_manager(model_name)
+        return {name: _load_task(manager, name) for name in task_names}
 
 
 def _messages(lm: Any, image: Image.Image, prompt: str) -> list[dict[str, Any]]:

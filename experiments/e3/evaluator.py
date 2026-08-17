@@ -22,6 +22,7 @@ if os.getenv("OPENAI_API_KEY"):
     os.environ.setdefault("JUDGE_MODEL_NAME", os.getenv("MODEL_VERSION", "gpt-4o-mini"))
     os.environ.setdefault("USE_LLM_JUDGE", "True")
 
+from experiments.distributed import distributed_context, merge_rank_jsonl
 from experiments.e2.config import ModelSpec
 from experiments.e2.data import source_indices
 from experiments.e2.image import ImagePlan, aligned_high_resolution, lowres_plan, resize
@@ -79,17 +80,14 @@ def evaluate_condition(
     *,
     scoring_version: str = SCORING_VERSION,
 ) -> dict[str, Any]:
+    distributed = distributed_context()
     condition_dir = output_dir / condition.name
     condition_dir.mkdir(parents=True, exist_ok=True)
     result_path = condition_dir / "results.json"
     sample_path = condition_dir / "samples.jsonl"
-    if result_path.exists() and sample_path.exists():
-        cached = json.loads(result_path.read_text(encoding="utf-8"))
-        if cached.get("prompt_version") != PROMPT_VERSION:
-            raise ValueError(
-                f"existing E3 output for {condition.name} uses an incompatible prompt version"
-            )
-        return cached
+    if distributed.is_main:
+        merge_rank_jsonl(sample_path, key="sample_id")
+    distributed.barrier()
     task_indices = {
         task_name: source_indices(config.e2_config(), task_name)
         for task_name in config.tasks
@@ -100,31 +98,41 @@ def evaluate_condition(
         for source_index in indices
     }
     completed_samples = _read_completed_samples(sample_path, expected_sample_ids)
+    if result_path.exists():
+        cached = json.loads(result_path.read_text(encoding="utf-8"))
+        if cached.get("prompt_version") != PROMPT_VERSION:
+            raise ValueError(
+                f"existing E3 output for {condition.name} uses an incompatible prompt version"
+            )
+        if len(completed_samples) == len(expected_sample_ids):
+            return cached
+    if distributed.is_main and result_path.exists():
+        result_path.unlink()
+    distributed.barrier()
+    write_sample_path = (
+        distributed.rank_path(sample_path) if distributed.enabled else sample_path
+    )
     session = E3Session(condition, anchor_window=config.anchor_window)
     patch = install_e3(lm.model, session)
     try:
-        task_results: dict[str, Any] = {}
         for task_name in config.tasks:
             task = tasks[task_name]
             documents = task.eval_docs
             indices = task_indices[task_name]
             sample_ids = [f"{task_name}:{source_index}" for source_index in indices]
-            rows = [completed_samples[sample_id] for sample_id in sample_ids if sample_id in completed_samples]
-            metric_values: dict[str, list[Any]] = {}
-            for record in rows:
-                for name, value in record["metrics"].items():
-                    if isinstance(value, (int, float, bool)):
-                        metric_values.setdefault(name, []).append(value)
             pending_indices = [
                 source_index
                 for source_index, sample_id in zip(indices, sample_ids)
                 if sample_id not in completed_samples
             ]
+            local_indices = distributed.shard(pending_indices)
             for source_index in tqdm(
-                pending_indices,
-                total=len(indices),
-                initial=len(rows),
-                desc=f"{model_name} {condition.name} {task_name}",
+                local_indices,
+                total=len(local_indices),
+                desc=(
+                    f"{model_name} {condition.name} {task_name} "
+                    f"rank {distributed.rank}/{distributed.world_size}"
+                ),
             ):
                 doc = documents[source_index]
                 sample_id = f"{task_name}:{source_index}"
@@ -159,34 +167,71 @@ def evaluate_condition(
                         "scoring_version": scoring_version,
                     }
                 )
-                rows.append(record)
                 completed_samples[sample_id] = record
-                for name, value in processed.items():
-                    if isinstance(value, (int, float, bool)):
-                        metric_values.setdefault(name, []).append(value)
-                with sample_path.open("a", encoding="utf-8") as stream:
+                with write_sample_path.open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-            metrics = {}
-            aggregators = task.aggregation()
-            for name, values in metric_values.items():
-                aggregator = aggregators.get(name)
-                metrics[name] = float(
-                    aggregator(values) if aggregator is not None else sum(values) / len(values)
-                )
-            task_results[task_name] = {
-                "metrics": metrics,
-                "primary_score": _primary_metric(task_name, metrics),
-                "samples": len(rows),
-            }
-        payload = _result_payload(
-            spec.pretrained, model_name, condition, task_results, scoring_version
-        )
-        result_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        return payload
+        distributed.barrier()
+        if distributed.is_main:
+            merge_rank_jsonl(sample_path, key="sample_id")
+            completed = _read_completed_samples(sample_path, expected_sample_ids)
+            payload = _aggregate_condition(
+                config,
+                model_name,
+                spec,
+                condition,
+                tasks,
+                task_indices,
+                completed,
+                scoring_version,
+            )
+            _write_json(result_path, payload)
+        distributed.barrier()
+        return json.loads(result_path.read_text(encoding="utf-8"))
     finally:
         patch.remove()
+
+
+def _aggregate_condition(
+    config: E3Config,
+    model_name: str,
+    spec: ModelSpec,
+    condition: Condition,
+    tasks: dict[str, Any],
+    task_indices: dict[str, list[int]],
+    completed: dict[str, dict[str, Any]],
+    scoring_version: str,
+) -> dict[str, Any]:
+    task_results: dict[str, Any] = {}
+    for task_name in config.tasks:
+        sample_ids = [f"{task_name}:{index}" for index in task_indices[task_name]]
+        missing = [sample_id for sample_id in sample_ids if sample_id not in completed]
+        if missing:
+            raise RuntimeError(
+                f"distributed E3 condition {condition.name} is missing {len(missing)} samples"
+            )
+        rows = [completed[sample_id] for sample_id in sample_ids]
+        metric_values: dict[str, list[Any]] = {}
+        for record in rows:
+            for name, value in record["metrics"].items():
+                if isinstance(value, (int, float, bool)):
+                    metric_values.setdefault(name, []).append(value)
+        aggregators = tasks[task_name].aggregation()
+        metrics = {
+            name: float(
+                aggregators[name](values)
+                if aggregators.get(name) is not None
+                else sum(values) / len(values)
+            )
+            for name, values in metric_values.items()
+        }
+        task_results[task_name] = {
+            "metrics": metrics,
+            "primary_score": _primary_metric(task_name, metrics),
+            "samples": len(rows),
+        }
+    return _result_payload(
+        spec.pretrained, model_name, condition, task_results, scoring_version
+    )
 
 
 def _read_completed_samples(path: Path, expected_ids: set[str]) -> dict[str, dict[str, Any]]:

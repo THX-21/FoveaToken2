@@ -10,7 +10,7 @@ files consumed by normal TokenFovea inference.
 ## NVIDIA environment
 
 Use a fresh Python 3.11 environment. Qwen3.5 requires a recent Transformers build. A GPU with at
-least 32 GB available memory is recommended; `device_map=auto` also supports multiple GPUs.
+least 32 GB available memory is recommended for each worker.
 
 ```bash
 git submodule update --init --recursive
@@ -44,6 +44,18 @@ The single-command equivalent, which avoids reloading the model between the two 
 python -m experiments.e1 run --model qwen25
 python -m experiments.e1 run --model qwen35
 ```
+
+To split samples across four GPUs, launch one model replica per GPU with `torchrun`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 \
+  -m experiments.e1 run --model qwen35
+```
+
+This is sample data parallelism: every GPU processes a disjoint subset of the natural, controlled,
+and visualization samples. Rank-local checkpoints under `outputs/e1/<model>/.distributed/` are
+merged by rank 0, so interrupted runs remain resumable. Do not launch `analyze` or `report` with
+`torchrun`; the `run` command already executes those rank-0-only stages.
 
 The scan uses BF16, SDPA, batch size one, greedy decoding, and seed 42. It processes 100 images
 from each of COCO Caption Lite, Flickr30k Lite, and NoCaps Lite, plus 100 controlled collages.
