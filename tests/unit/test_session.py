@@ -107,6 +107,8 @@ class SessionTest(unittest.TestCase):
         full_keys = torch.randn(1, 1, 19, 4)
         _, _, active_ids = session.compose(0, full_keys, full_keys, full_keys[..., -1:, :])
         first_anchor = session._anchor_positions(active_ids, torch.device("cpu")).clone()
+        self.assertTrue(torch.all(first_anchor[1:] > 16))
+        self.assertTrue(torch.all(first_anchor[1:] < 19))
         session.record_decode_layer(0, None)
         self.assertEqual(session._decode_text_indices, {})
 
@@ -115,6 +117,8 @@ class SessionTest(unittest.TestCase):
         _, _, active_ids = session.compose(0, full_keys, full_keys, full_keys[..., -1:, :])
         second_anchor = session._anchor_positions(active_ids, torch.device("cpu"))
         self.assertFalse(torch.equal(first_anchor, second_anchor))
+        self.assertTrue(torch.all(second_anchor[1:] > 17))
+        self.assertTrue(torch.all(second_anchor[1:] < 20))
 
     def test_decode_batch_expansion_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "beam search"):

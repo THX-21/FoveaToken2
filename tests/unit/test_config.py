@@ -4,6 +4,9 @@ from tokenfovea.config import FoveaConfig
 
 
 class ConfigTest(unittest.TestCase):
+    def test_text_anchor_allows_zero_left_extension(self):
+        self.assertEqual(FoveaConfig(anchor_window=0).anchor_window, 0)
+
     def test_rejects_invalid_values(self):
         with self.assertRaises(ValueError):
             FoveaConfig(budget=0)

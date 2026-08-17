@@ -1,7 +1,11 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from experiments.e2.config import E2Config, ModelSpec
 from experiments.e2.data import validate_manifest
+from experiments.e2.evaluator import _read_completed_samples
 
 
 class E2DataManifestTest(unittest.TestCase):
@@ -26,6 +30,25 @@ class E2DataManifestTest(unittest.TestCase):
         payload["tasks"]["vqav2_val_lite"].pop()
         with self.assertRaisesRegex(ValueError, "exactly 2"):
             validate_manifest(config, payload)
+
+    def test_reads_completed_samples_for_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "samples.jsonl"
+            first = {"sample_id": "vqav2_val_lite:4", "metrics": {"exact_match": 1}}
+            path.write_text(json.dumps(first) + "\n{", encoding="utf-8")
+
+            completed = _read_completed_samples(path, {"vqav2_val_lite:4", "vqav2_val_lite:7"})
+
+            self.assertEqual(completed, {"vqav2_val_lite:4": first})
+
+    def test_rejects_duplicate_completed_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "samples.jsonl"
+            row = json.dumps({"sample_id": "vqav2_val_lite:4", "metrics": {}})
+            path.write_text(row + "\n" + row + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                _read_completed_samples(path, {"vqav2_val_lite:4"})
 
 
 if __name__ == "__main__":

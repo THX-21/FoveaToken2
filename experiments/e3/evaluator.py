@@ -1,20 +1,41 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+from dotenv import load_dotenv
 from PIL import Image
 from tqdm import tqdm  # type: ignore[import-untyped]
+
+load_dotenv()
+if os.getenv("OPENAI_API_KEY"):
+    os.environ.setdefault("JUDGE_API_KEY", os.environ["OPENAI_API_KEY"])
+    os.environ.setdefault("JUDGE_BASE_URL", os.getenv("OPENAI_API_URL", ""))
+    os.environ.setdefault("JUDGE_MODEL_NAME", os.getenv("MODEL_VERSION", "gpt-4o-mini"))
+    os.environ.setdefault("USE_LLM_JUDGE", "True")
 
 from experiments.e2.config import ModelSpec
 from experiments.e2.data import source_indices
 from experiments.e2.image import ImagePlan, aligned_high_resolution, lowres_plan, resize
-from experiments.e2.evaluator import load_tasks
+from experiments.e2.evaluator import _validate_image_token_count, load_tasks
+from lmms_eval.tasks._task_utils.reasoning_utils import (
+    JUDGE_MAX_TOKENS,
+    JUDGE_THINKING,
+    MODEL_NAME,
+    USE_LLM_JUDGE,
+    compute_score,
+    extract_anwser_tag,
+    format_reward,
+    llm_as_judge_sync,
+)
 
 from .conditions import Condition
 from .config import E3Config
@@ -22,13 +43,16 @@ from .patch import install_e3
 from .session import E3Session
 
 
-ANALYSIS_INSTRUCTION = """Look carefully at the image and answer the question using the relevant visual evidence.
-First, write a focused and natural analysis explaining how the image supports your conclusion. Keep it relevant, avoid unnecessary repetition, and do not exceed 200 words. Then give the final answer as briefly as possible.
-
-Use exactly these labels:
-Analyze: <your analysis>
-Answer: <your final answer>"""
-PROMPT_VERSION = "analyze_answer_v1"
+PROMPT_VERSION = "lmms_reasoning_v6"
+SCORING_VERSION = "llm_judge_invalid_format_v1"
+ANSWER_LENGTH_INSTRUCTION = "Answer the question using a single word or phrase."
+ANSWER_WORD_INSTRUCTION = "Answer the question with a single word."
+REASONING_SYSTEM_PROMPT = (
+    "You are a helpful assistant. When the user asks a question, your response must include two "
+    "parts: first, the reasoning process enclosed in `<analysis>...</analysis>` tags, followed by "
+    "a clear, concise final answer enclosed in `<answer>...</answer>` tags that directly addresses "
+    "the question and contains only the short final answer without explanation."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +76,8 @@ def evaluate_condition(
     lm: Any,
     output_dir: Path,
     tasks: dict[str, Any],
+    *,
+    scoring_version: str = SCORING_VERSION,
 ) -> dict[str, Any]:
     condition_dir = output_dir / condition.name
     condition_dir.mkdir(parents=True, exist_ok=True)
@@ -64,8 +90,16 @@ def evaluate_condition(
                 f"existing E3 output for {condition.name} uses an incompatible prompt version"
             )
         return cached
-    if sample_path.exists():
-        sample_path.unlink()
+    task_indices = {
+        task_name: source_indices(config.e2_config(), task_name)
+        for task_name in config.tasks
+    }
+    expected_sample_ids = {
+        f"{task_name}:{source_index}"
+        for task_name, indices in task_indices.items()
+        for source_index in indices
+    }
+    completed_samples = _read_completed_samples(sample_path, expected_sample_ids)
     session = E3Session(condition, anchor_window=config.anchor_window)
     patch = install_e3(lm.model, session)
     try:
@@ -73,10 +107,23 @@ def evaluate_condition(
         for task_name in config.tasks:
             task = tasks[task_name]
             documents = task.eval_docs
+            indices = task_indices[task_name]
+            sample_ids = [f"{task_name}:{source_index}" for source_index in indices]
+            rows = [completed_samples[sample_id] for sample_id in sample_ids if sample_id in completed_samples]
             metric_values: dict[str, list[Any]] = {}
-            row_count = 0
+            for record in rows:
+                for name, value in record["metrics"].items():
+                    if isinstance(value, (int, float, bool)):
+                        metric_values.setdefault(name, []).append(value)
+            pending_indices = [
+                source_index
+                for source_index, sample_id in zip(indices, sample_ids)
+                if sample_id not in completed_samples
+            ]
             for source_index in tqdm(
-                source_indices(config.e2_config(), task_name),
+                pending_indices,
+                total=len(indices),
+                initial=len(rows),
                 desc=f"{model_name} {condition.name} {task_name}",
             ):
                 doc = documents[source_index]
@@ -101,7 +148,7 @@ def evaluate_condition(
                     str(prompt),
                     task.get_config("generation_kwargs") or {},
                 )
-                processed = task.process_results(doc, [answer])
+                processed = _score_response(task_name, doc, str(prompt), record["raw_prediction"])
                 record.update(
                     {
                         "task": task_name,
@@ -109,14 +156,16 @@ def evaluate_condition(
                         "prediction": answer,
                         "target": task.doc_to_target(doc),
                         "metrics": _jsonable(processed),
+                        "scoring_version": scoring_version,
                     }
                 )
+                rows.append(record)
+                completed_samples[sample_id] = record
                 for name, value in processed.items():
                     if isinstance(value, (int, float, bool)):
                         metric_values.setdefault(name, []).append(value)
                 with sample_path.open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-                row_count += 1
             metrics = {}
             aggregators = task.aggregation()
             for name, values in metric_values.items():
@@ -127,23 +176,173 @@ def evaluate_condition(
             task_results[task_name] = {
                 "metrics": metrics,
                 "primary_score": _primary_metric(task_name, metrics),
-                "samples": row_count,
+                "samples": len(rows),
             }
-        payload = {
-            "model": spec.pretrained,
-            "model_alias": model_name,
-            "condition": condition.name,
-            "prompt_version": PROMPT_VERSION,
-            "tasks": task_results,
-            "macro_average": sum(row["primary_score"] for row in task_results.values())
-            / len(task_results),
-        }
+        payload = _result_payload(
+            spec.pretrained, model_name, condition, task_results, scoring_version
+        )
         result_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return payload
     finally:
         patch.remove()
+
+
+def _read_completed_samples(path: Path, expected_ids: set[str]) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    completed: dict[str, dict[str, Any]] = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1:
+                break
+            raise
+        sample_id = row.get("sample_id")
+        if not isinstance(sample_id, str) or sample_id not in expected_ids:
+            raise ValueError(f"invalid E3 sample ID in {path}: {sample_id!r}")
+        if sample_id in completed:
+            raise ValueError(f"duplicate E3 sample ID in {path}: {sample_id!r}")
+        if not isinstance(row.get("metrics"), dict):
+            raise ValueError(f"missing E3 metrics in {path}: {sample_id!r}")
+        completed[sample_id] = row
+    return completed
+
+
+def reevaluate_condition(
+    config: E3Config,
+    model_name: str,
+    spec: ModelSpec,
+    condition: Condition,
+    output_dir: Path,
+    tasks: dict[str, Any],
+    *,
+    scoring_version: str = SCORING_VERSION,
+    restart: bool = False,
+    workers: int = 8,
+) -> dict[str, Any]:
+    condition_dir = output_dir / condition.name
+    sample_path = condition_dir / "samples.jsonl"
+    result_path = condition_dir / "results.json"
+    task_indices = {
+        task_name: source_indices(config.e2_config(), task_name)
+        for task_name in config.tasks
+    }
+    expected_ids = {
+        f"{task_name}:{source_index}"
+        for task_name, indices in task_indices.items()
+        for source_index in indices
+    }
+    samples = _read_completed_samples(sample_path, expected_ids)
+    if len(samples) != len(expected_ids):
+        raise ValueError(
+            f"cannot reevaluate incomplete E3 condition {condition.name!r}: "
+            f"found {len(samples)} of {len(expected_ids)} samples"
+        )
+
+    task_results: dict[str, Any] = {}
+    for task_name in config.tasks:
+        task = tasks[task_name]
+        metric_values: dict[str, list[float]] = {}
+        completed = sum(
+            samples[f"{task_name}:{source_index}"].get("scoring_version") == scoring_version
+            for source_index in task_indices[task_name]
+        )
+        pending_indices = [
+            source_index
+            for source_index in task_indices[task_name]
+            if restart
+            or samples[f"{task_name}:{source_index}"].get("scoring_version") != scoring_version
+        ]
+        requests: dict[int, tuple[Any, str, str]] = {}
+        for source_index in pending_indices:
+            sample_id = f"{task_name}:{source_index}"
+            raw_prediction = samples[sample_id].get("raw_prediction")
+            if not isinstance(raw_prediction, str):
+                raise ValueError(f"missing raw_prediction for {sample_id}")
+            doc = task.eval_docs[source_index]
+            requests[source_index] = (doc, str(task.doc_to_text(doc)), raw_prediction)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _score_response,
+                    task_name,
+                    doc,
+                    prompt,
+                    raw_prediction,
+                ): source_index
+                for source_index, (doc, prompt, raw_prediction) in requests.items()
+            }
+            for future in tqdm(
+                as_completed(futures),
+                total=len(task_indices[task_name]),
+                initial=0 if restart else completed,
+                desc=f"reevaluate {model_name} {condition.name} {task_name}",
+            ):
+                source_index = futures[future]
+                sample_id = f"{task_name}:{source_index}"
+                samples[sample_id]["metrics"] = _jsonable(future.result())
+                samples[sample_id]["scoring_version"] = scoring_version
+                _write_jsonl(sample_path, list(samples.values()))
+        for source_index in task_indices[task_name]:
+            metrics = samples[f"{task_name}:{source_index}"]["metrics"]
+            for name, value in metrics.items():
+                metric_values.setdefault(name, []).append(float(value))
+        aggregators = task.aggregation()
+        metrics = {}
+        for name, values in metric_values.items():
+            aggregator = aggregators.get(name)
+            metrics[name] = float(aggregator(values) if aggregator is not None else sum(values) / len(values))
+        task_results[task_name] = {
+            "metrics": metrics,
+            "primary_score": _primary_metric(task_name, metrics),
+            "samples": len(task_indices[task_name]),
+        }
+
+    _write_jsonl(sample_path, list(samples.values()))
+    payload = _result_payload(
+        spec.pretrained, model_name, condition, task_results, scoring_version
+    )
+    _write_json(result_path, payload)
+    return payload
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    temporary = path.with_suffix(".jsonl.tmp")
+    temporary.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _result_payload(
+    pretrained: str,
+    model_name: str,
+    condition: Condition,
+    task_results: dict[str, Any],
+    scoring_version: str = SCORING_VERSION,
+) -> dict[str, Any]:
+    return {
+        "model": pretrained,
+        "model_alias": model_name,
+        "condition": condition.name,
+        "prompt_version": PROMPT_VERSION,
+        "scoring_version": scoring_version,
+        "tasks": task_results,
+        "macro_average": sum(row["primary_score"] for row in task_results.values())
+        / len(task_results),
+    }
 
 
 def _generate(
@@ -239,32 +438,58 @@ def _generate(
 
 
 def build_analysis_prompt(prompt: str) -> str:
-    return f"{prompt.rstrip()}\n\n{ANALYSIS_INSTRUCTION}"
+    return prompt.replace(ANSWER_LENGTH_INSTRUCTION, "").replace(ANSWER_WORD_INSTRUCTION, "").strip()
 
 
 def parse_response(response: str) -> ParsedResponse:
     raw = response.strip()
-    analyze_match = re.search(
-        r"(?ims)^\s*Analyze:\s*(.*?)\s*^\s*Answer:",
-        raw,
-    )
-    answer_matches = re.findall(r"(?im)^\s*Answer:\s*(.*?)\s*$", raw)
-    analyze = analyze_match.group(1).strip() if analyze_match else ""
-    if answer_matches:
-        answer = answer_matches[-1].strip()
-    else:
-        lines = [line.strip() for line in raw.splitlines() if line.strip()]
-        answer = lines[-1] if lines else raw
-        if answer.lower().startswith("answer:"):
-            answer = answer.split(":", 1)[1].strip()
+    format_compliant = format_reward(raw) == 1.0
+    answer = extract_anwser_tag(raw).strip() if format_compliant else ""
+    analysis_match = re.search(r"<(?:analysis|think)>(.*?)</(?:analysis|think)>", raw, flags=re.DOTALL)
+    analyze = analysis_match.group(1).strip() if analysis_match else ""
     word_count = len(re.findall(r"\b[\w'-]+\b", analyze, flags=re.UNICODE))
     return ParsedResponse(
         raw=raw,
         analyze=analyze,
         answer=answer,
-        format_compliant=analyze_match is not None and bool(answer_matches),
+        format_compliant=format_compliant,
         analyze_word_count=word_count,
     )
+
+
+def _score_response(task_name: str, doc: Any, question: str, response: str) -> dict[str, float]:
+    parsed = parse_response(response)
+    metric = "relaxed_overall" if task_name == "chartqa_lite" else "exact_match"
+    if not parsed.format_compliant:
+        score = (
+            llm_as_judge_sync(response, _ground_truth(task_name, doc), {"question": question})
+            if USE_LLM_JUDGE == "True"
+            else 0.0
+        )
+        return {metric: float(score), "format_score": 0.0}
+    score = compute_score(
+        data_source=task_name,
+        solution_str=response,
+        ground_truth=_ground_truth(task_name, doc),
+        extra_info={"question": question},
+    )
+    return {
+        metric: float(score["acc_score"]),
+        "format_score": float(score["format_reward_score"]),
+    }
+
+
+def llm_judge_status() -> tuple[bool, str, int, str]:
+    return USE_LLM_JUDGE == "True", MODEL_NAME, JUDGE_MAX_TOKENS, JUDGE_THINKING
+
+
+def _ground_truth(task_name: str, doc: Any) -> str:
+    if task_name == "vqav2_val_lite":
+        return str(doc["multiple_choice_answer"])
+    if task_name == "textvqa_val_lite":
+        answers = [str(answer) for answer in doc["answers"]]
+        return Counter(answers).most_common(1)[0][0]
+    return str(doc["answer"])
 
 
 def _prepare_inputs(
@@ -287,13 +512,17 @@ def _prepare_inputs(
     expected_grid = (1, plan.grid_height * merge_size, plan.grid_width * merge_size)
     if actual_grid != expected_grid:
         raise ValueError(f"processor grid {actual_grid} does not match E3 plan {expected_grid}")
+    _validate_image_token_count(inputs, lm.model)
     return inputs
 
 
 def _messages(lm: Any, image: Image.Image, prompt: str) -> list[dict[str, Any]]:
-    messages = []
-    if getattr(lm, "system_prompt", None):
-        messages.append({"role": "system", "content": lm.system_prompt})
+    messages = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": REASONING_SYSTEM_PROMPT}],
+        }
+    ]
     messages.append(
         {
             "role": "user",

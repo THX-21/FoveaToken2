@@ -26,6 +26,8 @@ def evaluate_condition(
     lm: Any,
     output_dir: Path,
     tasks: dict[str, Any] | None = None,
+    *,
+    thinking: bool = False,
 ) -> dict[str, Any]:
     condition_dir = output_dir / condition.name
     condition_dir.mkdir(parents=True, exist_ok=True)
@@ -33,10 +35,15 @@ def evaluate_condition(
     sample_path = condition_dir / "samples.jsonl"
     if result_path.exists() and sample_path.exists():
         return json.loads(result_path.read_text(encoding="utf-8"))
-    if sample_path.exists():
-        sample_path.unlink()
+    task_indices = {task_name: source_indices(config, task_name) for task_name in config.tasks}
+    expected_sample_ids = {
+        f"{task_name}:{source_index}"
+        for task_name, indices in task_indices.items()
+        for source_index in indices
+    }
+    completed_samples = _read_completed_samples(sample_path, expected_sample_ids)
     trace_path = condition_dir / "front_traces.jsonl"
-    if trace_path.exists():
+    if trace_path.exists() and not completed_samples:
         trace_path.unlink()
     session = E2Session(
         condition,
@@ -44,18 +51,31 @@ def evaluate_condition(
         area_ratios=config.area_ratios,
         trace_path=trace_path if condition.pooled else None,
     )
-    # Full and LowRes use the same hook only for timing; their attention forward returns unchanged.
-    patch = install_e2(lm.model, session)
+    patch = install_e2(lm.model, session) if _needs_patch(condition) else None
     try:
         task_manager = _task_manager(model_name) if tasks is None else None
         task_results: dict[str, Any] = {}
         for task_name in config.tasks:
             task = tasks[task_name] if tasks is not None else _load_task(task_manager, task_name)
             documents = task.eval_docs
-            rows: list[dict[str, Any]] = []
+            indices = task_indices[task_name]
+            sample_ids = [f"{task_name}:{source_index}" for source_index in indices]
+            rows = [completed_samples[sample_id] for sample_id in sample_ids if sample_id in completed_samples]
             metric_values: dict[str, list[Any]] = {}
+            for record in rows:
+                for name, value in record["metrics"].items():
+                    if isinstance(value, (int, float, bool)):
+                        metric_values.setdefault(name, []).append(value)
+            pending_indices = [
+                source_index
+                for source_index, sample_id in zip(indices, sample_ids)
+                if sample_id not in completed_samples
+            ]
             for source_index in tqdm(
-                source_indices(config, task_name), desc=f"{model_name} {condition.name} {task_name}"
+                pending_indices,
+                total=len(indices),
+                initial=len(rows),
+                desc=f"{model_name} {condition.name} {task_name}",
             ):
                 doc = documents[source_index]
                 sample_id = f"{task_name}:{source_index}"
@@ -65,7 +85,7 @@ def evaluate_condition(
                     raise ValueError("E2 requires one PIL image per sample")
                 answer, record = _generate(
                     config, model_name, spec, condition, lm, session,
-                    sample_id, visuals[0], str(prompt), task.get_config("generation_kwargs") or {},
+                    sample_id, visuals[0], str(prompt), task.get_config("generation_kwargs") or {}, thinking,
                 )
                 processed = task.process_results(doc, [answer])
                 record.update(
@@ -78,6 +98,7 @@ def evaluate_condition(
                     }
                 )
                 rows.append(record)
+                completed_samples[sample_id] = record
                 for name, value in processed.items():
                     if isinstance(value, (int, float, bool)):
                         metric_values.setdefault(name, []).append(value)
@@ -100,7 +121,37 @@ def evaluate_condition(
         result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return payload
     finally:
-        patch.remove()
+        if patch is not None:
+            patch.remove()
+
+
+def _read_completed_samples(path: Path, expected_ids: set[str]) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    completed: dict[str, dict[str, Any]] = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1:
+                break
+            raise
+        sample_id = row.get("sample_id")
+        if not isinstance(sample_id, str) or sample_id not in expected_ids:
+            raise ValueError(f"invalid E2 sample ID in {path}: {sample_id!r}")
+        if sample_id in completed:
+            raise ValueError(f"duplicate E2 sample ID in {path}: {sample_id!r}")
+        if not isinstance(row.get("metrics"), dict):
+            raise ValueError(f"missing E2 metrics in {path}: {sample_id!r}")
+        completed[sample_id] = row
+    return completed
+
+
+def _needs_patch(condition: Condition) -> bool:
+    return condition.pooled
 
 
 def _generate(
@@ -114,6 +165,7 @@ def _generate(
     image: Image.Image,
     prompt: str,
     generation_kwargs: dict[str, Any],
+    thinking: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     high = aligned_high_resolution(image, spec.pixel_per_token, spec.min_pixels, spec.max_pixels)
     target_tokens = None
@@ -141,6 +193,7 @@ def _generate(
                     resize(image, auxiliary_plan),
                     prompt,
                     auxiliary_plan,
+                    thinking,
                 )
                 session.begin_native_capture(area_scale)
                 with torch.inference_mode():
@@ -154,9 +207,9 @@ def _generate(
         except Exception:
             session.abort_native_sample()
             raise
-    inputs = _prepare_inputs(lm, model_name, prepared_image, prompt, plan)
+    inputs = _prepare_inputs(lm, model_name, prepared_image, prompt, plan, thinking)
     kwargs = {
-        "max_new_tokens": min(int(generation_kwargs.get("max_new_tokens", config.max_new_tokens)), config.max_new_tokens),
+        "max_new_tokens": _max_new_tokens(config, generation_kwargs, thinking),
         "do_sample": False,
         "num_beams": 1,
         "use_cache": True,
@@ -208,9 +261,10 @@ def _prepare_inputs(
     image: Image.Image,
     prompt: str,
     plan: Any,
+    thinking: bool = False,
 ):
     messages = _messages(lm, image, prompt)
-    text = _chat_template(lm, messages, model_name)
+    text = _chat_template(lm, messages, model_name, thinking)
     inputs = lm.processor(
         text=[text], images=[image], do_resize=False, return_tensors="pt"
     ).to(lm.device)
@@ -219,12 +273,34 @@ def _prepare_inputs(
     expected_grid = (1, plan.grid_height * merge_size, plan.grid_width * merge_size)
     if actual_grid != expected_grid:
         raise ValueError(f"processor grid {actual_grid} does not match E2 plan {expected_grid}")
+    _validate_image_token_count(inputs, lm.model)
     return inputs
 
 
 def _task_manager(model_name: str):
     from lmms_eval.tasks import TaskManager
-    return TaskManager(verbosity="ERROR", model_name="qwen_vl" if model_name == "qwen25" else "qwen3_5")
+    return TaskManager(verbosity="ERROR", model_name=_lmms_model_name(model_name))
+
+
+def _lmms_model_name(model_name: str) -> str:
+    return "qwen2_5_vl" if model_name == "qwen25" else "qwen3_5"
+
+
+def _max_new_tokens(config: E2Config, generation_kwargs: dict[str, Any], thinking: bool) -> int:
+    if thinking:
+        return 2048
+    return min(int(generation_kwargs.get("max_new_tokens", config.max_new_tokens)), config.max_new_tokens)
+
+
+def _validate_image_token_count(inputs: Any, model: Any) -> None:
+    image_tokens = int((inputs["input_ids"] == model.config.image_token_id).sum())
+    expected_tokens = int(inputs["image_grid_thw"].prod()) // int(
+        model.config.vision_config.spatial_merge_size
+    ) ** 2
+    if image_tokens != expected_tokens:
+        raise ValueError(
+            f"E2 image token count {image_tokens} does not match visual features {expected_tokens}"
+        )
 
 
 def _load_task(manager: Any, task_name: str) -> Any:
@@ -248,10 +324,10 @@ def _messages(lm: Any, image: Image.Image, prompt: str) -> list[dict[str, Any]]:
     return messages
 
 
-def _chat_template(lm: Any, messages: list[dict[str, Any]], model_name: str) -> str:
+def _chat_template(lm: Any, messages: list[dict[str, Any]], model_name: str, thinking: bool = False) -> str:
     kwargs = {"tokenize": False, "add_generation_prompt": True}
     if model_name == "qwen35":
-        kwargs["enable_thinking"] = False
+        kwargs["enable_thinking"] = thinking
     return lm.processor.apply_chat_template(messages, **kwargs)
 
 

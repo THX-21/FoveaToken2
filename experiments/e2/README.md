@@ -25,7 +25,7 @@ prefills (`/2` and `/4`), retain only full-attention-layer visual K/V, and repor
 ```bash
 git submodule update --init
 pip install -e third_party/lmms-eval
-pip install --upgrade "huggingface-hub<1" transformers accelerate datasets pillow pyyaml qwen-vl-utils
+pip install --upgrade huggingface-hub "transformers>=4.57.0" accelerate datasets decord pillow pyyaml qwen-vl-utils
 export PYTHONPATH="$PWD/src:$PWD"
 ```
 
@@ -49,4 +49,23 @@ python -m experiments.e2 run --model qwen25 --condition random_fixed_native
 python -m experiments.e2 run --model qwen25 --condition random_perstep_native
 ```
 
+Qwen3.5 thinking is off by default. Enable it with a 2048-token generation limit:
+
+```bash
+python -m experiments.e2 run --model qwen35 --thinking
+python -m experiments.e2 analyze --model qwen35 --thinking
+python -m experiments.e2 report --model qwen35 --thinking
+```
+
 Outputs are stored under `outputs/e2/<model>/`. Completed condition result files are reused on restart.
+Results generated before E2 protocol version 3 used an incorrect Qwen2.5 task prompt and cannot be resumed.
+Keep them for diagnosis by moving the directory, then rerun:
+
+```bash
+mv outputs/e2/qwen25 outputs/e2/qwen25_invalid_prompt
+CUDA_VISIBLE_DEVICES=0 python -m experiments.e2 run --model qwen25
+```
+
+E2 uses the Qwen2.5 slow image processor to keep visual tokenization stable across Transformers releases.
+E2 uses one GPU only. By default it uses the first visible GPU; choose a physical GPU with, for example,
+`CUDA_VISIBLE_DEVICES=0 python -m experiments.e2 run --model qwen25`.

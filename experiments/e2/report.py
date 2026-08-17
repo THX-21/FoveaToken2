@@ -8,10 +8,11 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 from .config import E2Config
+from .runner import run_name
 
 
-def build_report(config: E2Config, model_name: str) -> Path:
-    root = config.output_dir / model_name
+def build_report(config: E2Config, model_name: str, *, thinking: bool = False) -> Path:
+    root = config.output_dir / run_name(model_name, thinking)
     summary_path = root / "summary.json"
     if not summary_path.exists():
         raise FileNotFoundError("run E2 analyze before report")
@@ -36,7 +37,7 @@ body{{font-family:system-ui,sans-serif;margin:2rem;color:#222}}table{{border-col
 th,td{{border:1px solid #ccc;padding:5px 8px}}th{{background:#eee;position:sticky;top:0}}
 .figures{{display:flex;gap:1rem;flex-wrap:wrap}}figure{{margin:0}}img{{max-width:360px;border:1px solid #bbb}}
 </style></head><body><h1>E2 coarse visual representation report</h1>
-<p>Model: <code>{html.escape(model_name)}</code>. Scores use the original lmms-eval task metrics.</p>
+<p>Model: <code>{html.escape(run_name(model_name, thinking))}</code>. Scores use the original lmms-eval task metrics.</p>
 <h2>Summary</h2><table><thead><tr>{headers}</tr></thead><tbody>{table}</tbody></table>
 <h2>Representative regressions</h2>{errors}
 <h2>Representative random fronts</h2><div class="figures">{figures}</div>

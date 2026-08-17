@@ -396,13 +396,23 @@ class FoveaSession:
             return cached
         if self.current_position_ids is None:
             raise RuntimeError("text_anchor requires current position ids")
-        topology = self._topologies[device]
         current = self.current_position_ids[..., -1:].to(device=device, dtype=torch.float32)
-        centers = topology.normalized_centers.index_select(0, active_ids)
+        pyramid = next(iter(self.pyramids.values()))
+        selected_positions = pyramid.native_positions.to(device=device).index_select(-1, active_ids)
+        spatial = selected_positions[1:]
         positions = current.expand(-1, -1, active_ids.numel()).clone()
         window = self.config.anchor_window
-        positions[1] = current[1] - window + (window + 1.0) * centers[:, 0]
-        positions[2] = current[2] - window + (window + 1.0) * centers[:, 1]
+        minimum = spatial.amin(dim=-1, keepdim=True)
+        span = spatial.amax(dim=-1, keepdim=True) - minimum
+        normalized = torch.where(
+            span > 0,
+            (spatial - minimum) / span,
+            torch.full_like(spatial, 0.5),
+        )
+        count = active_ids.numel()
+        positions[1:] = current[1:] - window + (window + 1.0) * (
+            1.0 + (count - 1) * normalized
+        ) / (count + 1)
         self._decode_anchor_positions[device] = positions
         return positions
 

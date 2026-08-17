@@ -35,6 +35,7 @@ def prepare_data(config: E1Config, *, force: bool = False) -> dict[str, int]:
         }
 
     from datasets import load_dataset  # type: ignore[import-untyped]
+    from huggingface_hub import try_to_load_from_cache
 
     natural_dir = config.data_dir / "images" / "natural"
     controlled_dir = config.data_dir / "images" / "controlled"
@@ -43,12 +44,17 @@ def prepare_data(config: E1Config, *, force: bool = False) -> dict[str, int]:
     rng = random.Random(config.seed)
     natural_records: list[dict[str, Any]] = []
     for source in config.natural_sources:
-        dataset = load_dataset(
-            "lmms-lab-encoder/LMMs-Eval-Lite",
-            source.dataset_name,
-            split="lite",
-            token=True,
-        )
+        filename = f"{source.dataset_name}/lite-00000-of-00001.parquet"
+        cached_path = try_to_load_from_cache("lmms-lab-encoder/LMMs-Eval-Lite", filename, repo_type="dataset")
+        if isinstance(cached_path, str):
+            dataset = load_dataset("parquet", data_files=cached_path, split="train")
+        else:
+            dataset = load_dataset(
+                "lmms-lab-encoder/LMMs-Eval-Lite",
+                source.dataset_name,
+                split="lite",
+                token=True,
+            )
         if source.count > len(dataset):
             raise ValueError(
                 f"source {source.dataset_name} contains {len(dataset)} rows, fewer than requested {source.count}"

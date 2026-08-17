@@ -4,11 +4,17 @@ import types
 import torch
 
 from experiments.e2.conditions import get_condition
+from experiments.e2.evaluator import _needs_patch
 from experiments.e2.patch import _compact_attention, install_e2
 from experiments.e2.session import E2Session
 
 
 class E2CompactAttentionTest(unittest.TestCase):
+    def test_only_pooled_conditions_need_the_attention_patch(self):
+        self.assertFalse(_needs_patch(get_condition("full")))
+        self.assertFalse(_needs_patch(get_condition("lowres_2")))
+        self.assertTrue(_needs_patch(get_condition("uniform2_kv_center")))
+
     def test_uses_explicit_original_position_mask(self):
         query = torch.zeros(1, 1, 2, 1)
         key = torch.zeros(1, 1, 4, 1)

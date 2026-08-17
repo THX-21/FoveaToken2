@@ -13,8 +13,8 @@ from experiments.e2.config import DEFAULT_AREA_RATIOS, DEFAULT_TASKS, E2Config, 
 class E3Config:
     seed: int = 42
     sample_count: int = 100
-    max_new_tokens: int = 320
-    anchor_window: float = 8.0
+    max_new_tokens: int = 1024
+    anchor_window: float = 2.0
     e2_data_dir: Path = Path("data/e2")
     output_dir: Path = Path("outputs/e3")
     tasks: tuple[str, ...] = DEFAULT_TASKS
@@ -40,8 +40,8 @@ class E3Config:
     def validate(self) -> None:
         if self.seed < 0 or self.sample_count <= 0 or self.max_new_tokens <= 0:
             raise ValueError("seed must be non-negative and counts must be positive")
-        if self.anchor_window <= 0:
-            raise ValueError("anchor_window must be positive")
+        if self.anchor_window < 0:
+            raise ValueError("anchor_window must be non-negative")
         if not self.tasks or not self.models:
             raise ValueError("E3 requires tasks and model specifications")
         for spec in self.models.values():

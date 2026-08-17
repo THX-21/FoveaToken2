@@ -8,6 +8,7 @@ from typing import Any
 
 from .conditions import CONDITIONS
 from .config import E2Config
+from .runner import run_name
 
 
 LOWRES_BASELINE = {
@@ -45,8 +46,8 @@ NATIVE_POOLING_BASELINES = {
 }
 
 
-def analyze(config: E2Config, model_name: str) -> list[dict[str, Any]]:
-    root = config.output_dir / model_name
+def analyze(config: E2Config, model_name: str, *, thinking: bool = False) -> list[dict[str, Any]]:
+    root = config.output_dir / run_name(model_name, thinking)
     results: dict[str, Any] = {}
     samples: dict[str, dict[str, dict[str, Any]]] = {}
     for condition in CONDITIONS:

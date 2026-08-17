@@ -19,9 +19,9 @@ from .conditions import Condition
 class E3Session:
     """Decode-only Text-Anchor state while preserving each pair's E2 prefill."""
 
-    def __init__(self, condition: Condition, *, anchor_window: float = 8.0):
-        if anchor_window <= 0:
-            raise ValueError("anchor_window must be positive")
+    def __init__(self, condition: Condition, *, anchor_window: float = 2.0):
+        if anchor_window < 0:
+            raise ValueError("anchor_window must be non-negative")
         self.condition = condition
         self.anchor_window = anchor_window
         self.position_encoder: PositionEncoder | None = None
@@ -403,7 +403,8 @@ class E3Session:
         else:
             raw_keys = front.pool(source.raw_keys, -2)
             values = front.pool(source.values, -2)
-        anchors = self._anchor_positions(front, raw_keys.device)
+        positions = front.pool(source.positions.to(raw_keys.device), -1)
+        anchors = self._anchor_positions(positions, raw_keys.device)
         cos, sin = self.position_encoder(reference, anchors)
         return self.rotate_key(raw_keys, cos, sin), values
 
@@ -450,23 +451,25 @@ class E3Session:
         values.index_copy_(-2, output, source.values[4].index_select(-2, indices))
         return keys, values
 
-    def _anchor_positions(self, front: BlockFront, device: torch.device) -> torch.Tensor:
+    def _anchor_positions(self, positions: torch.Tensor, device: torch.device) -> torch.Tensor:
         assert self.current_positions is not None
         current = self.current_positions[..., -1:].to(device=device, dtype=torch.float32)
-        anchors = current.expand(-1, -1, front.node_count).clone()
-        centers_y = torch.tensor(
-            [(node.y0 + node.size / 2) / front.height for node in front.nodes],
-            device=device,
-        )
-        centers_x = torch.tensor(
-            [(node.x0 + node.size / 2) / front.width for node in front.nodes],
-            device=device,
+        count = positions.shape[-1]
+        anchors = current.expand(-1, -1, count).clone()
+        spatial = positions[1:].to(device=device, dtype=torch.float32)
+        minimum = spatial.amin(dim=-1, keepdim=True)
+        span = spatial.amax(dim=-1, keepdim=True) - minimum
+        normalized = torch.where(
+            span > 0,
+            (spatial - minimum) / span,
+            torch.full_like(spatial, 0.5),
         )
         window = self.anchor_window
-        anchors[1] = current[1] - window + (window + 1.0) * centers_y
-        anchors[2] = current[2] - window + (window + 1.0) * centers_x
-        spatial = anchors[1:]
-        minimum, maximum = float(spatial.min()), float(spatial.max())
+        anchors[1:] = current[1:] - window + (window + 1.0) * (
+            1.0 + (count - 1) * normalized
+        ) / (count + 1)
+        anchored_spatial = anchors[1:]
+        minimum, maximum = float(anchored_spatial.min()), float(anchored_spatial.max())
         self.anchor_min = minimum if self.anchor_min is None else min(self.anchor_min, minimum)
         self.anchor_max = maximum if self.anchor_max is None else max(self.anchor_max, maximum)
         return anchors

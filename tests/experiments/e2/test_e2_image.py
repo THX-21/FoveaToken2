@@ -1,8 +1,12 @@
 import unittest
+from types import SimpleNamespace
+
+import torch
 
 from PIL import Image
 
 from experiments.e2.image import aligned_high_resolution, lowres_plan, matched_lowres_plan
+from experiments.e2.evaluator import _validate_image_token_count
 
 
 class E2ImagePlanTest(unittest.TestCase):
@@ -30,6 +34,21 @@ class E2ImagePlanTest(unittest.TestCase):
         if high.grid_width % 8 or high.grid_height % 8:
             self.skipTest("chosen E2 plan is intentionally only four-aligned")
         self.assertEqual(lowres_plan(high, 8).visual_tokens, high.visual_tokens // 64)
+
+    def test_image_token_count_matches_visual_grid(self):
+        inputs = {
+            "input_ids": torch.tensor([[1, 99, 99, 99, 99, 2]]),
+            "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        }
+        model = SimpleNamespace(
+            config=SimpleNamespace(image_token_id=99, vision_config=SimpleNamespace(spatial_merge_size=2))
+        )
+
+        _validate_image_token_count(inputs, model)
+
+        inputs["input_ids"][0, 4] = 2
+        with self.assertRaisesRegex(ValueError, "image token count"):
+            _validate_image_token_count(inputs, model)
 
 
 if __name__ == "__main__":

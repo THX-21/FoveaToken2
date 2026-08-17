@@ -81,6 +81,7 @@ class E1AttentionProbe:
         top_fraction: float = 0.05,
         trace_heads: set[tuple[int, int]] | None = None,
         trace_path: str | Path | None = None,
+        checkpoint: bool = False,
     ) -> None:
         self.model = model
         self.output_dir = Path(output_dir)
@@ -88,6 +89,8 @@ class E1AttentionProbe:
         self.top_fraction = top_fraction
         self.trace_heads = trace_heads or set()
         self.trace_path = Path(trace_path) if trace_path is not None else None
+        self.checkpoint = checkpoint
+        self.checkpoint_path = self.output_dir / "probe_checkpoint.json"
         self.model_type = str(getattr(model.config, "model_type", ""))
         if self.model_type not in {"qwen2_5_vl", "qwen3_5"}:
             raise ValueError(f"unsupported E1 model type: {self.model_type}")
@@ -103,6 +106,9 @@ class E1AttentionProbe:
         self._natural_totals: dict[tuple[int, int], dict[str, float]] = {}
         self._gaze_totals: dict[tuple[int, int], dict[str, Any]] = {}
         self._sample_count = {"natural": 0, "gaze": 0, "null": 0}
+        self._completed_sample_ids: set[str] = set()
+        if self.checkpoint:
+            self._load_checkpoint()
         self._reset_sample()
         self.handle = self._install()
 
@@ -161,6 +167,7 @@ class E1AttentionProbe:
     def end_sample(self, generated_text: str = "") -> None:
         if self.sample_id is None or self.sample_kind is None:
             return
+        sample_id = self.sample_id
         if self.sample_kind in {"natural", "trace"}:
             self._finish_natural()
         elif self.sample_kind in {"gaze", "null"}:
@@ -177,7 +184,13 @@ class E1AttentionProbe:
             }
             with self.trace_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if self.checkpoint:
+            self._completed_sample_ids.add(sample_id)
+            self.save()
         self._reset_sample()
+
+    def is_complete(self, sample_id: str) -> bool:
+        return sample_id in self._completed_sample_ids
 
     def _finish_natural(self) -> None:
         for layer, sums in self._sample_sums.items():
@@ -269,6 +282,25 @@ class E1AttentionProbe:
         _write_json(self.output_dir / "natural_metrics.json", natural)
         _write_json(self.output_dir / "gaze_metrics.json", gaze)
         _write_json(self.output_dir / "probe_metadata.json", metadata)
+        if self.checkpoint:
+            _write_json(
+                self.checkpoint_path,
+                {
+                    "completed_sample_ids": sorted(self._completed_sample_ids),
+                    "natural_totals": _encode_totals(self._natural_totals),
+                    "gaze_totals": _encode_gaze_totals(self._gaze_totals),
+                    "sample_counts": self._sample_count,
+                },
+            )
+
+    def _load_checkpoint(self) -> None:
+        if not self.checkpoint_path.exists():
+            return
+        payload = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+        self._completed_sample_ids = set(payload.get("completed_sample_ids", []))
+        self._natural_totals = _decode_totals(payload.get("natural_totals", {}))
+        self._gaze_totals = _decode_gaze_totals(payload.get("gaze_totals", {}))
+        self._sample_count.update(payload.get("sample_counts", {}))
 
     def _install(self) -> ProbeHandle:
         hooks = []
@@ -370,4 +402,38 @@ def _call_arguments(signature: inspect.Signature, args: tuple[Any, ...], kwargs:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _encode_totals(totals: dict[tuple[int, int], dict[str, float]]) -> dict[str, dict[str, float]]:
+    return {f"{layer}:{head}": values for (layer, head), values in totals.items()}
+
+
+def _decode_totals(payload: dict[str, dict[str, float]]) -> dict[tuple[int, int], dict[str, float]]:
+    return {tuple(map(int, key.split(":"))): values for key, values in payload.items()}
+
+
+def _encode_gaze_totals(totals: dict[tuple[int, int], dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    encoded = {}
+    for (layer, head), values in totals.items():
+        encoded[f"{layer}:{head}"] = {
+            "matrix": values["matrix"].tolist(),
+            "matrix_count": values["matrix_count"].tolist(),
+            "null": values["null"].tolist(),
+            "null_count": values["null_count"],
+        }
+    return encoded
+
+
+def _decode_gaze_totals(payload: dict[str, dict[str, Any]]) -> dict[tuple[int, int], dict[str, Any]]:
+    decoded = {}
+    for key, values in payload.items():
+        decoded[tuple(map(int, key.split(":")))] = {
+            "matrix": torch.tensor(values["matrix"], dtype=torch.float64),
+            "matrix_count": torch.tensor(values["matrix_count"], dtype=torch.int64),
+            "null": torch.tensor(values["null"], dtype=torch.float64),
+            "null_count": values["null_count"],
+        }
+    return decoded

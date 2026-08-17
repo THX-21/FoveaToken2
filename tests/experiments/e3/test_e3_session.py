@@ -25,6 +25,17 @@ def _session(condition_name: str) -> tuple[E3Session, torch.Tensor]:
 
 
 class E3SessionTest(unittest.TestCase):
+    def test_text_anchor_uses_selected_range_and_midpoint_for_degenerate_axes(self):
+        session = E3Session(get_condition("full_text_anchor"), anchor_window=2)
+        session.current_positions = torch.full((3, 1, 1), 20)
+        positions = torch.tensor([[[0.0, 0.0]], [[3.0, 3.0]], [[1.0, 5.0]]])
+
+        anchors = session._anchor_positions(positions, torch.device("cpu"))
+
+        self.assertTrue(torch.equal(anchors[0], torch.full((1, 2), 20.0)))
+        self.assertTrue(torch.allclose(anchors[1], torch.full((1, 2), 19.5)))
+        self.assertTrue(torch.allclose(anchors[2], torch.tensor([[19.0, 20.0]])))
+
     def test_pool2_control_uses_center_positions_during_decode(self):
         session, raw = _session("pool2_center")
         self.assertTrue(session.enabled)
@@ -47,8 +58,12 @@ class E3SessionTest(unittest.TestCase):
         self.assertTrue(torch.equal(output_values, values))
         self.assertEqual(mask.shape, (1, 1, 1, 19))
         self.assertEqual(float(keys[0, 0, 0, 0]), float(full[0, 0, 0, 0]))
-        self.assertAlmostEqual(float(keys[0, 0, 1, 0]), 1 + 20 - 8 + 9 * 0.125)
+        self.assertAlmostEqual(float(keys[0, 0, 1, 0]), 1 + 20 - 8 + 9 / 17, places=5)
         self.assertEqual(float(keys[0, 0, -1, 0]), float(full[0, 0, -1, 0]))
+        source = session.sources[0]
+        anchors = session._anchor_positions(source.positions, torch.device("cpu"))
+        self.assertTrue(torch.all(anchors[1:] > 12))
+        self.assertTrue(torch.all(anchors[1:] < 21))
 
     def test_pool2_prefill_uses_center_and_decode_uses_same_pooled_values(self):
         session, raw = _session("pool2_text_anchor")
@@ -63,7 +78,7 @@ class E3SessionTest(unittest.TestCase):
         self.assertEqual(keys.shape[-2], 7)
         self.assertEqual(mask.shape, (1, 1, 1, 7))
         self.assertAlmostEqual(float(values[0, 0, 0, 0]), 103.5)
-        self.assertAlmostEqual(float(keys[0, 0, 0, 0]), 3.5 + 20 - 8 + 9 * 0.25)
+        self.assertAlmostEqual(float(keys[0, 0, 0, 0]), 3.5 + 20 - 8 + 9 / 5, places=5)
 
     def test_native2_reads_only_scale4_bank(self):
         session = E3Session(get_condition("native2_text_anchor"), anchor_window=8)

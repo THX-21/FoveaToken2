@@ -24,8 +24,8 @@ class E3ConditionsTest(unittest.TestCase):
     def test_default_config_reuses_e2_manifest(self):
         config = E3Config.load("experiments/e3/configs/default.yaml")
         self.assertEqual(config.sample_count, 100)
-        self.assertEqual(config.max_new_tokens, 320)
-        self.assertEqual(config.anchor_window, 8.0)
+        self.assertEqual(config.max_new_tokens, 1024)
+        self.assertEqual(config.anchor_window, 2.0)
         self.assertEqual(str(config.e2_data_dir), "data/e2")
 
 

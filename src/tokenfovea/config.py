@@ -14,7 +14,7 @@ class FoveaConfig:
     pooling_mode: Literal["kv", "hidden", "native_multiscale"] = "kv"
     signal_selection: str | None = None
     signal_aggregation: Literal["mean", "max"] = "mean"
-    anchor_window: float = 8.0
+    anchor_window: float = 2.0
     update_interval: int = 1
     max_swaps: int = 100
     epsilon: float = 0.05
@@ -35,8 +35,8 @@ class FoveaConfig:
             raise ValueError("hidden pooling cannot be combined with post_rope_pool")
         if self.pooling_mode == "native_multiscale" and self.position_mode == "post_rope_pool":
             raise ValueError("native_multiscale cannot be combined with post_rope_pool")
-        if self.anchor_window <= 0:
-            raise ValueError("anchor_window must be positive")
+        if self.anchor_window < 0:
+            raise ValueError("anchor_window must be non-negative")
         if self.budget <= 0:
             raise ValueError("budget must be positive")
         if self.update_interval <= 0:

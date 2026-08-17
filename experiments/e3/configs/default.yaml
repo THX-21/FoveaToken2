@@ -1,7 +1,7 @@
 seed: 42
 sample_count: 100
-max_new_tokens: 320
-anchor_window: 8.0
+max_new_tokens: 1024
+anchor_window: 2.0
 e2_data_dir: data/e2
 output_dir: outputs/e3
 

@@ -71,12 +71,14 @@ def load_model(spec: ModelSpec, model_name: str) -> tuple[Any, Any]:
         device_map="auto",
         attn_implementation="sdpa",
         trust_remote_code=True,
+        local_files_only=True,
     ).eval()
     processor = AutoProcessor.from_pretrained(
         spec.pretrained,
         min_pixels=spec.min_pixels,
         max_pixels=spec.max_pixels,
         trust_remote_code=True,
+        local_files_only=True,
     )
     return model, processor
 
@@ -89,10 +91,12 @@ def _scan(
     processor: Any,
     output_dir: Path,
 ) -> None:
-    probe = E1AttentionProbe(model, output_dir, top_fraction=config.hybrid_top_fraction)
+    probe = E1AttentionProbe(model, output_dir, top_fraction=config.hybrid_top_fraction, checkpoint=True)
     try:
         natural = list(read_jsonl(config.data_dir / "natural.jsonl"))
-        for record in tqdm(natural, desc=f"{model_name} natural probe"):
+        natural_done = sum(probe.is_complete(record["id"]) for record in natural)
+        pending_natural = [record for record in natural if not probe.is_complete(record["id"])]
+        for record in tqdm(pending_natural, total=len(natural), desc=f"{model_name} natural probe", initial=natural_done):
             image = _load_image(config, record)
             inputs = _prepare_inputs(model_name, model, processor, image, record["prompt"])
             probe.begin_sample(record["id"], "natural", inputs["input_ids"], inputs["image_grid_thw"])
@@ -109,12 +113,22 @@ def _scan(
             probe.end_sample(text)
 
         controlled = list(read_jsonl(config.data_dir / "controlled.jsonl"))
-        for record in tqdm(controlled, desc=f"{model_name} gaze probe"):
+        sample_ids = [
+            f"{record['id']}-panel-{panel}"
+            for record in controlled
+            for panel in range(len(record["prompts"]))
+        ] + [f"{record['id']}-null" for record in controlled]
+        controlled_done = sum(probe.is_complete(sample_id) for sample_id in sample_ids)
+        progress = tqdm(total=len(sample_ids), desc=f"{model_name} gaze probe", initial=controlled_done)
+        for record in controlled:
             image = _load_image(config, record)
             for panel, prompt in enumerate(record["prompts"]):
+                sample_id = f"{record['id']}-panel-{panel}"
+                if probe.is_complete(sample_id):
+                    continue
                 inputs = _prepare_inputs(model_name, model, processor, image, prompt)
                 probe.begin_sample(
-                    f"{record['id']}-panel-{panel}",
+                    sample_id,
                     "gaze",
                     inputs["input_ids"],
                     inputs["image_grid_thw"],
@@ -123,13 +137,19 @@ def _scan(
                 with torch.inference_mode():
                     model(**inputs, use_cache=False, return_dict=True)
                 probe.end_sample()
+                progress.update()
+            null_id = f"{record['id']}-null"
+            if probe.is_complete(null_id):
+                continue
             inputs = _prepare_inputs(model_name, model, processor, image, record["null_prompt"])
             probe.begin_sample(
-                f"{record['id']}-null", "null", inputs["input_ids"], inputs["image_grid_thw"]
+                null_id, "null", inputs["input_ids"], inputs["image_grid_thw"]
             )
             with torch.inference_mode():
                 model(**inputs, use_cache=False, return_dict=True)
             probe.end_sample()
+            progress.update()
+        progress.close()
         probe.save()
         metadata_path = output_dir / "probe_metadata.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))

@@ -1,4 +1,5 @@
 .venv/
+.env
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -12,3 +13,5 @@ outputs/
 traces/
 *.png
 agent.md
+uv.lock
+*.pdf

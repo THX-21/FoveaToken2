@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenfovea"
+version = "0.1.0"
+description = "Fixed-budget multi-scale visual KV routing"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=0.29.1",
+    "datasets>=2.19.0",
+    "decord",
+    "huggingface-hub>=0.30.0",
+    "lmms-eval",
+    "pillow",
+    "python-dotenv",
+    "pyyaml",
+    "qwen-vl-utils>=0.0.14",
+    "torch",
+    "torchvision",
+    "tqdm",
+    "transformers>=4.57.0",
+]
+
+[project.scripts]
+tokenfovea = "tokenfovea.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+lmms-eval = { path = "third_party/lmms-eval", editable = true }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
