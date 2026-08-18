@@ -87,3 +87,10 @@ and token-matched low-resolution inputs on four lmms-eval Lite tasks. See
 E3 pairs four fixed visual representations with normal position encoding and decode-only
 `text_anchor`, using a bounded `Analyze`/`Answer` response format. See
 [`experiments/e3/README.md`](experiments/e3/README.md).
+
+## E4 formal dynamic routing evaluation
+
+E4 compares token-matched LowRes, fixed Native fronts, prefill-only routing, per-step dynamic routing,
+and E1 Top-8 versus all-head signals on high-resolution and general benchmarks. It provides separate
+official-prompt and multi-token mechanism protocols. See
+[`experiments/e4/README.md`](experiments/e4/README.md).

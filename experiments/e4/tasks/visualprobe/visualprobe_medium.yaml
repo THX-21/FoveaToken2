@@ -1,0 +1,16 @@
+dataset_path: Mini-o3/VisualProbe_Medium
+task: visualprobe_medium
+test_split: validation
+output_type: generate_until
+doc_to_visual: !function utils.visualprobe_doc_to_visual
+doc_to_text: !function utils.visualprobe_doc_to_text
+doc_to_target: !function utils.visualprobe_doc_to_target
+process_results: !function utils.visualprobe_process_results
+generation_kwargs:
+  max_new_tokens: 128
+  do_sample: false
+  num_beams: 1
+metric_list:
+  - metric: visualprobe_accuracy
+    aggregation: !function utils.mean
+    higher_is_better: true

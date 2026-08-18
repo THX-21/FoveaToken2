@@ -1,0 +1,1 @@
+"""HRScene Testmini adapter."""

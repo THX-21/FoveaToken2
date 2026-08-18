@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import torch
 
@@ -12,11 +14,30 @@ from .router import SplitMergeRouter
 from .topology import DeviceTreeTopology, VisualTokenForest
 
 
+@dataclass(frozen=True, slots=True)
+class RouteEvent:
+    """Device-resident routing update exposed to optional experiment observers."""
+
+    phase: Literal["prefill", "decode"]
+    step: int
+    updated: bool
+    active_before: torch.Tensor
+    active_after: torch.Tensor
+    node_scores: torch.Tensor
+    swaps: torch.Tensor
+    forest: VisualTokenForest
+
+
 class FoveaSession:
     """Routing state for one prompt shared by patched decoder layers."""
 
-    def __init__(self, config: FoveaConfig):
+    def __init__(
+        self,
+        config: FoveaConfig,
+        route_observer: Callable[[RouteEvent], None] | None = None,
+    ):
         self.config = config
+        self.route_observer = route_observer
         self.selected_heads = self._load_signal_selection(config.signal_selection)
         self._head_index_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.position_encoder: PositionEncoder | None = None
@@ -373,7 +394,22 @@ class FoveaSession:
             leaf_scores = leaf_scores / self.prompt_signal_count
         leaf_scores = leaf_scores / leaf_scores.sum().clamp_min(1e-12)
         scores = self.topology.aggregate_leaves(leaf_scores, density=self.config.score_mode == "density")
-        self.router.step(scores)
+        active_before = self.router.active_ids() if self.route_observer is not None else None
+        swaps = self.router.step(scores)
+        if self.route_observer is not None:
+            assert active_before is not None and self.forest is not None
+            self.route_observer(
+                RouteEvent(
+                    phase="prefill",
+                    step=0,
+                    updated=True,
+                    active_before=active_before,
+                    active_after=self.router.active_ids(),
+                    node_scores=scores,
+                    swaps=swaps,
+                    forest=self.forest,
+                )
+            )
 
     def _text_index(self, full_length: int, device: torch.device) -> torch.Tensor:
         device = torch.device(device)
@@ -532,8 +568,27 @@ class FoveaSession:
                         density=self.config.score_mode == "density",
                     )
                 self.ema_leaf_scores = leaf_scores
-            if self.decode_step % self.config.update_interval == 0:
+            updated = self.decode_step % self.config.update_interval == 0
+            active_before = self.router.active_ids() if self.route_observer is not None else None
+            swaps = (
                 self.router.step(node_scores)
+                if updated
+                else torch.zeros((), dtype=torch.long, device=node_scores.device)
+            )
+            if self.route_observer is not None:
+                assert active_before is not None and self.forest is not None
+                self.route_observer(
+                    RouteEvent(
+                        phase="decode",
+                        step=self.decode_step,
+                        updated=updated,
+                        active_before=active_before,
+                        active_after=self.router.active_ids(),
+                        node_scores=node_scores,
+                        swaps=swaps,
+                        forest=self.forest,
+                    )
+                )
         self.step_signal_sum = None
         self.step_signal_count = 0
         self._decode_active_ids = None
