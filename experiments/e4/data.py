@@ -10,13 +10,8 @@ from typing import Any
 
 from .config import E4Config
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 VISUALPROBE_TASKS = ("visualprobe_easy", "visualprobe_medium", "visualprobe_hard")
-VISUALPROBE_REPOS = (
-    "Mini-o3/VisualProbe_Easy",
-    "Mini-o3/VisualProbe_Medium",
-    "Mini-o3/VisualProbe_Hard",
-)
 
 
 def prepare_data(
@@ -27,8 +22,10 @@ def prepare_data(
 ) -> Path:
     path = config.data_dir / "sample_manifest.json"
     if path.exists() and not force:
-        validate_manifest(config, json.loads(path.read_text(encoding="utf-8")))
-        return path
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing.get("version") == MANIFEST_VERSION:
+            validate_manifest(config, existing)
+            return path
     if tasks is None:
         from .evaluator import load_tasks
 
@@ -75,7 +72,7 @@ def prepare_data(
         "seed": config.seed,
         "formal": formal,
         "reasoning": mechanism,
-        "compression": mechanism,
+        "compression": formal,
         "logical_counts": {
             "visualprobe": sum(len(mechanism.get(name, ())) for name in VISUALPROBE_TASKS),
             "vstar_bench": len(mechanism.get("vstar_bench", ())),
@@ -90,37 +87,63 @@ def prepare_data(
 
 
 def prepare_external_assets(config: E4Config) -> dict[str, str]:
-    """Download image files stored outside benchmark annotation tables."""
-    from huggingface_hub import hf_hub_download, snapshot_download
-
-    visual_root = Path(
-        os.getenv("VISUALPROBE_ROOT", str(config.data_dir / "visualprobe"))
+    """Validate and, when necessary, extract locally downloaded E4 image assets."""
+    datasets_root = Path(
+        os.getenv("E4_DATASETS_ROOT", str(config.data_dir / "datasets"))
     ).expanduser()
-    visual_root.mkdir(parents=True, exist_ok=True)
-    for repo_id in VISUALPROBE_REPOS:
-        snapshot_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            local_dir=visual_root,
-            allow_patterns=["*.jpg", "*.jpeg", "*.png", "*.webp"],
+    visual_root = Path(
+        os.getenv("VISUALPROBE_ROOT", str(datasets_root))
+    ).expanduser()
+    missing_visual: list[Path] = []
+    for task_name in VISUALPROBE_TASKS:
+        subset = datasets_root / task_name
+        annotations = subset / "val.json"
+        if not annotations.is_file():
+            raise FileNotFoundError(f"missing VisualProbe annotations: {annotations}")
+        for row in json.loads(annotations.read_text(encoding="utf-8")):
+            relative = Path(str(row["images"][0]))
+            candidates = (
+                visual_root / relative,
+                visual_root / task_name / "data" / relative.name,
+                visual_root / relative.name,
+            )
+            if not any(candidate.is_file() for candidate in candidates):
+                missing_visual.append(relative)
+    if missing_visual:
+        shown = ", ".join(str(path) for path in missing_visual[:5])
+        raise FileNotFoundError(
+            f"VisualProbe is missing {len(missing_visual)} referenced image(s): {shown}"
         )
 
     finers_root = Path(
-        os.getenv("FINERS4K_IMAGE_ROOT", str(config.data_dir / "finers4k" / "images"))
+        os.getenv(
+            "FINERS4K_IMAGE_ROOT", str(datasets_root / "finers4k" / "images")
+        )
     ).expanduser()
     finers_root.mkdir(parents=True, exist_ok=True)
-    marker = finers_root / ".extracted"
-    if not marker.is_file():
-        archive = Path(
-            hf_hub_download(
-                repo_id="Jiazuo98/Finers-4k-benchmark",
-                repo_type="dataset",
-                filename="all_images.zip",
-                local_dir=config.data_dir / "finers4k",
-            )
-        )
+    annotations = datasets_root / "finers4k" / "labels" / "all_annotations_final_test_v5.json"
+    if not annotations.is_file():
+        raise FileNotFoundError(f"missing FineRS annotations: {annotations}")
+    payload = json.loads(annotations.read_text(encoding="utf-8"))
+    referenced = [Path(str(row["image_path"])).name for row in payload["annotations"]]
+    if referenced and not any(
+        (finers_root / "all_images" / name).is_file() for name in referenced
+    ):
+        archive = datasets_root / "finers4k" / "all_images.zip"
+        if not archive.is_file():
+            raise FileNotFoundError(f"missing FineRS image archive: {archive}")
         _safe_extract(archive, finers_root)
-        marker.write_text("all_images.zip\n", encoding="utf-8")
+    missing_finers = [
+        name
+        for name in referenced
+        if not (finers_root / name).is_file()
+        and not (finers_root / "all_images" / name).is_file()
+    ]
+    if missing_finers:
+        shown = ", ".join(missing_finers[:5])
+        raise FileNotFoundError(
+            f"FineRS is missing {len(missing_finers)} referenced image(s): {shown}"
+        )
     return {"visualprobe": str(visual_root), "finers4k": str(finers_root)}
 
 
@@ -130,6 +153,8 @@ def validate_manifest(config: E4Config, payload: dict[str, Any]) -> None:
     formal = payload.get("formal")
     if not isinstance(formal, dict) or set(formal) != set(config.formal_tasks):
         raise ValueError("E4 formal manifest tasks do not match config")
+    if payload.get("compression") != formal:
+        raise ValueError("E4 compression manifest must reuse the formal sample indices")
     for suite in ("formal", "reasoning", "compression"):
         rows = payload.get(suite)
         if not isinstance(rows, dict):

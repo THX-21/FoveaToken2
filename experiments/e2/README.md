@@ -14,7 +14,10 @@ this experiment tests representation quality, not physical KV-cache compression.
 - Native fixed and per-step random conditions using the same fronts as their pooled counterparts.
 
 Fixed pooled conditions apply the same coarse representation to prompt text prefill and decode. Per-step random
-conditions use full prefill and resample a legal local front for every decode step.
+conditions prefill through the penultimate prompt token with a deterministic initial random front, resample once
+at that boundary, and run the final prompt token with the new front. They then resample a legal local front for
+every subsequent decode step. This follows the same cached final-prompt-token protocol as E4; fixed-random
+conditions remain fixed across the complete prompt and decode sequence.
 
 There are 20 conditions. E2 evaluates native scales 1/4/16; the shared implementation also supports
 area scale 64 (8×8 nodes), but E2 does not schedule that scale. Native conditions perform two auxiliary

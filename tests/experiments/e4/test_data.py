@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from experiments.e4.config import E4Config, ModelSpec
@@ -53,3 +54,12 @@ def test_manifest_filters_finers_and_stratifies_visualprobe(tmp_path):
     assert len(reasoning["vstar_bench"]) == 4
     assert len(reasoning["finers_qa"]) == 4
     assert len(reasoning["hrscene_testmini"]) == 4
+    compression = suite_indices(config, "compression")
+    assert compression == formal
+
+    obsolete = json.loads(path.read_text(encoding="utf-8"))
+    obsolete["version"] = 1
+    obsolete["compression"] = obsolete["reasoning"]
+    path.write_text(json.dumps(obsolete), encoding="utf-8")
+    prepare_data(config, tasks)
+    assert suite_indices(config, "compression") == formal

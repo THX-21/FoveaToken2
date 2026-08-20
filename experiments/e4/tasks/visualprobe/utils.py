@@ -10,7 +10,7 @@ from PIL import Image
 
 def _root() -> Path:
     value = os.getenv("VISUALPROBE_ROOT")
-    return Path(value).expanduser() if value else Path("data/e4/visualprobe")
+    return Path(value).expanduser() if value else Path("data/e4/datasets")
 
 
 def visualprobe_doc_to_visual(doc: dict[str, Any]) -> list[Image.Image]:
@@ -19,7 +19,12 @@ def visualprobe_doc_to_visual(doc: dict[str, Any]) -> list[Image.Image]:
         raise ValueError("VisualProbe requires exactly one image path")
     path = Path(str(values[0]))
     if not path.is_file():
-        candidates = (_root() / path, _root() / path.name)
+        subset = path.parts[0].lower()
+        candidates = (
+            _root() / path,
+            _root() / subset / "data" / path.name,
+            _root() / path.name,
+        )
         path = next((candidate for candidate in candidates if candidate.is_file()), path)
     if not path.is_file():
         raise FileNotFoundError(

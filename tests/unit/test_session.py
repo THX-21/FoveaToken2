@@ -162,3 +162,61 @@ class SessionTest(unittest.TestCase):
                     torch.full((active_ids.numel(),), 1.0 / active_ids.numel()),
                 )
                 self.assertEqual(session.router.active_ids().numel(), active_ids.numel())
+
+    def test_prefill_prefix_routes_after_all_layers_for_cached_final_token(self):
+        events = []
+        session = FoveaSession(
+            FoveaConfig(mode="dynamic", budget=4, max_swaps=1),
+            route_observer=events.append,
+        )
+        session.attach(
+            [0, 1],
+            lambda reference, positions: (
+                torch.ones_like(reference[..., : positions.shape[-1], :]),
+                torch.zeros_like(reference[..., : positions.shape[-1], :]),
+            ),
+            lambda key, cos, sin: key,
+        )
+        input_ids = torch.tensor([[1] + [99] * 16 + [2, 3]])
+        session.configure_prompt(
+            input_ids,
+            torch.tensor([[1, 8, 8]]),
+            image_token_id=99,
+            spatial_merge_size=2,
+        )
+        positions = torch.arange(input_ids.shape[-1]).repeat(3, 1, 1)
+        session.observe_position_ids(positions)
+        raw = torch.arange(input_ids.shape[-1], dtype=torch.float32).view(
+            1, 1, -1, 1
+        )
+        session.capture_prefill_layer(0, raw, raw + 100, raw, None)
+
+        keys, values, queries, mask, initial_ids = session.compose_prefill(
+            0, raw, raw + 100, raw
+        )
+        self.assertEqual(initial_ids.numel(), 4)
+        self.assertEqual(queries.tolist(), [17, 18])
+        self.assertEqual(keys.shape[-2], 7)
+        self.assertEqual(values.shape, keys.shape)
+        self.assertFalse(bool(mask[0, 0, 0, -1]))
+        self.assertTrue(bool(mask[0, 0, 1].all()))
+
+        signal = torch.tensor([[0.7, 0.1, 0.1, 0.1]])
+        session.record_prefill_layer(0, signal, initial_ids)
+        self.assertEqual(events, [])
+        self.assertFalse(session.prefill_route_complete)
+
+        session.capture_prefill_layer(1, raw, raw + 100, raw, None)
+        _, _, _, _, second_layer_ids = session.compose_prefill(
+            1, raw, raw + 100, raw
+        )
+        self.assertTrue(torch.equal(second_layer_ids, initial_ids))
+        session.record_prefill_layer(1, signal, second_layer_ids)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].phase, "prefill")
+        self.assertTrue(torch.equal(events[0].active_before, initial_ids))
+        self.assertTrue(session.prefill_route_complete)
+
+        full = torch.cat((raw, raw[..., -1:, :]), dim=-2)
+        _, _, cached_token_ids = session.compose(1, full, full, full[..., -1:, :])
+        self.assertTrue(torch.equal(cached_token_ids, events[0].active_after))

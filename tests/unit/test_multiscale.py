@@ -39,16 +39,41 @@ class NativeImagePlanTest(unittest.TestCase):
             min_pixels=32 * 32,
             max_pixels=256 * 256,
         )
-        result = proxy(text=["prompt"], images=[Image.new("RGB", (101, 77))], videos=None)
+        result = proxy(
+            text=["prompt"],
+            images=[Image.new("RGB", (101, 77)), Image.new("RGB", (77, 101))],
+            videos=None,
+        )
 
         self.assertEqual(proxy.marker, "processor-attribute")
         main_width, main_height = result["image_sizes"][0]
+        second_width, second_height = result["image_sizes"][1]
         self.assertEqual(main_width % (32 * 8), 0)
         self.assertEqual(main_height % (32 * 8), 0)
+        self.assertEqual(second_width % (32 * 8), 0)
+        self.assertEqual(second_height % (32 * 8), 0)
         pending = result["_tokenfovea_native_inputs"]
-        self.assertEqual(pending[4]["image_sizes"], [(main_width // 2, main_height // 2)])
-        self.assertEqual(pending[16]["image_sizes"], [(main_width // 4, main_height // 4)])
-        self.assertEqual(pending[64]["image_sizes"], [(main_width // 8, main_height // 8)])
+        self.assertEqual(
+            pending[4]["image_sizes"],
+            [
+                (main_width // 2, main_height // 2),
+                (second_width // 2, second_height // 2),
+            ],
+        )
+        self.assertEqual(
+            pending[16]["image_sizes"],
+            [
+                (main_width // 4, main_height // 4),
+                (second_width // 4, second_height // 4),
+            ],
+        )
+        self.assertEqual(
+            pending[64]["image_sizes"],
+            [
+                (main_width // 8, main_height // 8),
+                (second_width // 8, second_height // 8),
+            ],
+        )
 
 
 if __name__ == "__main__":

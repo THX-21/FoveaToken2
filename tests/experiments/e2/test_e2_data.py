@@ -5,7 +5,10 @@ from pathlib import Path
 
 from experiments.e2.config import E2Config, ModelSpec
 from experiments.e2.data import validate_manifest
-from experiments.e2.evaluator import _read_completed_samples
+from experiments.e2.evaluator import (
+    RANDOM_PERSTEP_PREFILL_PROTOCOL,
+    _read_completed_samples,
+)
 
 
 class E2DataManifestTest(unittest.TestCase):
@@ -49,6 +52,19 @@ class E2DataManifestTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 _read_completed_samples(path, {"vqav2_val_lite:4"})
+
+    def test_rejects_obsolete_random_perstep_prefill_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "samples.jsonl"
+            row = {"sample_id": "vqav2_val_lite:4", "metrics": {}}
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "obsolete E2 random-per-step"):
+                _read_completed_samples(
+                    path,
+                    {"vqav2_val_lite:4"},
+                    required_prefill_protocol=RANDOM_PERSTEP_PREFILL_PROTOCOL,
+                )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from .conditions import Condition, Suite, conditions_for_suite
+from .conditions import Condition, Suite, conditions_for_suite, ratio_label
 from .config import E4Config
 
 
@@ -21,7 +21,11 @@ def analyze(
     all_results: dict[tuple[str, str], dict[str, Any]] = {}
     all_samples: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
     for suite in selected_suites:
-        for condition in conditions_for_suite(suite):
+        for condition in conditions_for_suite(
+            suite,
+            config.compression_ratio,
+            config.compression_ratios,
+        ):
             result_path = root / suite / condition.name / "results.json"
             sample_path = root / suite / condition.name / "samples.jsonl"
             if not result_path.is_file() or not sample_path.is_file():
@@ -30,19 +34,23 @@ def analyze(
                 result_path.read_text(encoding="utf-8")
             )
             all_samples[(suite, condition.name)] = _sample_map(sample_path)
-    if "compression" in selected_suites and ("reasoning", "full") not in all_results:
-        result_path = root / "reasoning" / "full" / "results.json"
-        sample_path = root / "reasoning" / "full" / "samples.jsonl"
+    if "compression" in selected_suites and ("formal", "full") not in all_results:
+        result_path = root / "formal" / "full" / "results.json"
+        sample_path = root / "formal" / "full" / "samples.jsonl"
         if not result_path.is_file() or not sample_path.is_file():
             raise FileNotFoundError(
-                "E4 compression analysis requires reasoning/full for the high-resolution prefill check"
+                "E4 compression analysis requires formal/full as its high-resolution baseline"
             )
-        all_results[("reasoning", "full")] = json.loads(result_path.read_text(encoding="utf-8"))
-        all_samples[("reasoning", "full")] = _sample_map(sample_path)
+        all_results[("formal", "full")] = json.loads(result_path.read_text(encoding="utf-8"))
+        all_samples[("formal", "full")] = _sample_map(sample_path)
 
     rows: list[dict[str, Any]] = []
     for suite in selected_suites:
-        conditions = conditions_for_suite(suite)
+        conditions = conditions_for_suite(
+            suite,
+            config.compression_ratio,
+            config.compression_ratios,
+        )
         for condition in conditions:
             result = all_results[(suite, condition.name)]
             samples = all_samples[(suite, condition.name)]
@@ -64,7 +72,7 @@ def analyze(
                     else _empty_pair()
                 )
                 if condition.native:
-                    prefill_suite = "reasoning" if suite == "compression" else suite
+                    prefill_suite = "formal" if suite == "compression" else suite
                     prefill_samples = all_samples.get((prefill_suite, "full"))
                     if prefill_samples is None:
                         raise FileNotFoundError(
@@ -72,11 +80,6 @@ def analyze(
                         )
                     prefill_pair = _pair_metrics(prefill_samples, samples, task_name)
                     pair["first_token_agreement"] = prefill_pair["first_token_agreement"]
-                if condition.native and pair["first_token_agreement"] != 1.0:
-                    raise ValueError(
-                        f"E4 prefill mismatch for {suite}/{condition.name}/{task_name}: "
-                        f"{pair['first_token_agreement']!r}"
-                    )
                 rows.append(
                     {
                         "suite": suite,
@@ -89,7 +92,16 @@ def analyze(
                         **_diagnostics(samples, task_name),
                     }
                 )
-            rows.extend(_visualprobe_group_rows(suite, condition, result, samples, all_results, all_samples))
+            rows.extend(
+                _visualprobe_group_rows(
+                    suite,
+                    condition,
+                    result,
+                    samples,
+                    all_results,
+                    all_samples,
+                )
+            )
             rows.append(
                 {
                     "suite": suite,
@@ -113,14 +125,18 @@ def analyze(
     return rows
 
 
-def _baseline(suite: str, condition: Condition) -> tuple[str, str]:
+def _baseline(
+    suite: str,
+    condition: Condition,
+) -> tuple[str, str]:
+    lowres = f"lowres{ratio_label(condition.compression_ratio or 1.0)}"
     if suite == "compression":
-        return ("compression", "lowres2") if condition.name != "lowres2" else ("reasoning", "full")
+        return ("compression", lowres) if condition.kind != "lowres" else ("formal", "full")
     if condition.name == "full":
         return suite, "full"
-    if condition.name == "lowres4":
+    if condition.kind == "lowres":
         return suite, "full"
-    return suite, "lowres4"
+    return suite, lowres
 
 
 def _pair_metrics(
@@ -180,8 +196,15 @@ def _diagnostics(
     for name in (
         "highres_visual_tokens",
         "visual_tokens",
+        "prefill_active_tokens",
         "active_tokens",
         "compression_ratio",
+        "achieved_compression_ratio",
+        "token_retention_ratio",
+        "configured_compression_ratio",
+        "theoretical_target_visual_tokens",
+        "budget_relative_error",
+        "max_lowres_aspect_log_error",
         "retained_main_visual_tokens",
         "native_bank_tokens",
         "prefill_seconds",
@@ -194,7 +217,19 @@ def _diagnostics(
         "route_swap_count",
         "mean_front_jaccard",
     ):
-        values = [float(row[name]) for row in rows if row.get(name) is not None]
+        values = [
+            float(value)
+            for row in rows
+            if (
+                value := (
+                    row.get("visual_tokens")
+                    if name == "prefill_active_tokens"
+                    and row.get(name) is None
+                    else row.get(name)
+                )
+            )
+            is not None
+        ]
         result[name] = sum(values) / len(values) if values else None
     scales = {1: 0, 4: 0, 16: 0, 64: 0}
     for row in rows:
@@ -264,7 +299,7 @@ def _visualprobe_group_rows(
         else _empty_pair()
     )
     if condition.native:
-        prefill_suite = "reasoning" if suite == "compression" else suite
+        prefill_suite = "formal" if suite == "compression" else suite
         prefill_samples = all_samples.get((prefill_suite, "full"))
         if prefill_samples is not None:
             pair["first_token_agreement"] = _pair_metrics(
@@ -290,8 +325,21 @@ def _sample_map(path: Path) -> dict[str, dict[str, Any]]:
         if not line:
             continue
         row = json.loads(line)
+        if row.get("correct") is None:
+            row["correct"] = _structured_correct(row.get("metrics"))
         sample_id = str(row["sample_id"])
         if sample_id in rows:
             raise ValueError(f"duplicate E4 sample ID {sample_id!r}")
         rows[sample_id] = row
     return rows
+
+
+def _structured_correct(metrics: Any) -> bool | None:
+    if not isinstance(metrics, dict):
+        return None
+    for value in metrics.values():
+        if isinstance(value, dict) and "pred_answer" in value and "answer" in value:
+            return set(str(value["pred_answer"]).strip()) == set(
+                str(value["answer"]).strip()
+            )
+    return None

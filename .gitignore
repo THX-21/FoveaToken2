@@ -16,4 +16,6 @@ agent.md
 uv.lock
 *.pdf
 Qwen/*
+temp/*
 lmms-lab-encoder/*
+*.log

@@ -15,7 +15,7 @@ from .data import prepare_data
 from .evaluator import evaluate_condition, load_tasks
 from .runtime import validate_head_selection
 
-RUN_PROTOCOL_VERSION = 1
+RUN_PROTOCOL_VERSION = 3
 
 
 def run(
@@ -34,9 +34,22 @@ def run(
             "E4 formal inference requires an NVIDIA CUDA environment; run prepare or smoke_e4 locally"
         )
     conditions = (
-        [get_condition(condition_name, suite)]
+        [
+            get_condition(
+                condition_name,
+                suite,
+                config.compression_ratio,
+                config.compression_ratios,
+            )
+        ]
         if condition_name
-        else list(conditions_for_suite(suite))
+        else list(
+            conditions_for_suite(
+                suite,
+                config.compression_ratio,
+                config.compression_ratios,
+            )
+        )
     )
     if any(condition.use_top8 for condition in conditions):
         validate_head_selection(
@@ -53,9 +66,8 @@ def run(
     if distributed.is_main:
         if manifest_path.exists():
             previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if previous.get("version") != RUN_PROTOCOL_VERSION:
-                raise ValueError("existing E4 outputs use an incompatible protocol version")
-            manifest["completed"] = previous.get("completed", {})
+            if previous.get("version") == RUN_PROTOCOL_VERSION:
+                manifest["completed"] = previous.get("completed", {})
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )

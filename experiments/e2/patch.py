@@ -152,17 +152,6 @@ def _qwen25_forward(original, session: E2Session):
                     values = module.v_proj(nodes).view(batch, count, -1, module.head_dim).transpose(1, 2)
                     return keys, values
             session.capture_layer(module.layer_idx, raw_key, value, rotated_key, hidden_states, projector)
-            if session.preserve_prefill:
-                return original(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
         full_key, full_value = (
             past_key_values.update(rotated_key, value, module.layer_idx)
             if past_key_values is not None else (rotated_key, value)
@@ -182,6 +171,7 @@ def _qwen25_forward(original, session: E2Session):
                     module.num_key_value_groups, module.scaling, mask,
                 )
                 output.index_copy_(1, query_index, replacement)
+            session.finish_prefill_layer(module.layer_idx)
         else:
             keys, values, mask = session.decode_compact(module.layer_idx, full_key, full_value, raw_key)
             output = _compact_attention(
@@ -229,14 +219,6 @@ def _qwen35_forward(original, session: E2Session):
                     values = module.v_proj(nodes).view(nodes.shape[0], count, -1, module.head_dim).transpose(1, 2)
                     return keys, values
             session.capture_layer(module.layer_idx, raw_key, value, rotated_key, hidden_states, projector)
-            if session.preserve_prefill:
-                return original(
-                    hidden_states,
-                    position_embeddings=position_embeddings,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    **kwargs,
-                )
         full_key, full_value = (
             past_key_values.update(rotated_key, value, module.layer_idx)
             if past_key_values is not None else (rotated_key, value)
@@ -257,6 +239,7 @@ def _qwen35_forward(original, session: E2Session):
                     module.num_key_value_groups, module.scaling, mask,
                 )
                 output.index_copy_(1, query_index, replacement)
+            session.finish_prefill_layer(module.layer_idx)
         else:
             keys, values, mask = session.decode_compact(module.layer_idx, full_key, full_value, raw_key)
             output = _compact_attention(

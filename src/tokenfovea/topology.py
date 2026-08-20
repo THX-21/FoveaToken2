@@ -206,6 +206,8 @@ class VisualTokenForest:
             raise ValueError("target_budget must be positive")
         active = set(self.roots)
         target_budget = min(max(target_budget, len(active)), self.num_leaves)
+        if all(node.split_delta in {0, 3} for node in self.nodes):
+            return self._aligned_uniform_front(active, target_budget)
         while True:
             candidates = [self.node(i) for i in active if self.node(i).children]
             if not candidates:
@@ -224,6 +226,49 @@ class VisualTokenForest:
                 break
             active.remove(best.node_id)
             active.update(best.children)
+        self.validate_front(active)
+        return active
+
+    def _aligned_uniform_front(
+        self,
+        active: set[int],
+        target_budget: int,
+    ) -> set[int]:
+        """Distribute partial-level refinements across an aligned quadtree."""
+        expansions = round((target_budget - len(active)) / 3)
+        while expansions > 0:
+            candidates = [
+                self.node(node_id)
+                for node_id in active
+                if self.node(node_id).children
+            ]
+            if not candidates:
+                break
+            shallowest = min(node.depth for node in candidates)
+            level = sorted(
+                (node for node in candidates if node.depth == shallowest),
+                key=lambda node: (
+                    node.image_index,
+                    (node.y0 + node.y1) / self.grids[node.image_index][0],
+                    (node.x0 + node.x1) / self.grids[node.image_index][1],
+                ),
+            )
+            count = min(expansions, len(level))
+            # Midpoint sampling spreads a partial set over the whole level
+            # instead of refining the first row-major blocks only.
+            selected = [
+                level[
+                    min(
+                        len(level) - 1,
+                        ((2 * index + 1) * len(level)) // (2 * count),
+                    )
+                ]
+                for index in range(count)
+            ]
+            for node in selected:
+                active.remove(node.node_id)
+                active.update(node.children)
+            expansions -= count
         self.validate_front(active)
         return active
 

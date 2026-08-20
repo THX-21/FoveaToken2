@@ -22,7 +22,9 @@ def answerable(doc: dict[str, Any]) -> bool:
 def finers_doc_to_visual(doc: dict[str, Any]) -> list[Image.Image]:
     ann = annotation(doc)
     path = Path(str(ann.get("image_path", "")))
-    root = Path(os.getenv("FINERS4K_IMAGE_ROOT", "data/e4/finers4k/images")).expanduser()
+    root = Path(
+        os.getenv("FINERS4K_IMAGE_ROOT", "data/e4/datasets/finers4k/images")
+    ).expanduser()
     if not path.is_file():
         candidates = (root / path, root / path.name, root / "all_images" / path.name)
         path = next((candidate for candidate in candidates if candidate.is_file()), path)

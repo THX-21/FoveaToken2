@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,8 @@ class ModelSpec:
 class E4Config:
     seed: int = 42
     visual_token_cap: int = 4096
+    compression_ratio: float = 8.0
+    compression_ratios: tuple[float, ...] = (2.0, 4.0, 6.0, 8.0, 16.0)
     formal_max_new_tokens: int = 128
     reasoning_max_new_tokens: int = 256
     mechanism_count: int = 100
@@ -73,6 +76,10 @@ class E4Config:
         payload["models"] = {
             name: ModelSpec(**values) for name, values in payload.get("models", {}).items()
         }
+        payload["compression_ratios"] = tuple(
+            float(value)
+            for value in payload.get("compression_ratios", (2, 4, 6, 8, 16))
+        )
         payload["formal_tasks"] = tuple(payload.get("formal_tasks", FORMAL_TASKS))
         payload["mechanism_tasks"] = tuple(payload.get("mechanism_tasks", MECHANISM_TASKS))
         payload["primary_metrics"] = {
@@ -94,6 +101,22 @@ class E4Config:
             raise ValueError("seed must be non-negative")
         if self.visual_token_cap <= 0 or self.visual_token_cap % 64:
             raise ValueError("visual_token_cap must be positive and divisible by 64")
+        if (
+            not math.isfinite(self.compression_ratio)
+            or not 1.0 <= self.compression_ratio <= 64.0
+        ):
+            raise ValueError("compression_ratio must be finite and between 1 and 64")
+        if (
+            not self.compression_ratios
+            or len(set(self.compression_ratios)) != len(self.compression_ratios)
+            or any(
+                not math.isfinite(value) or not 1.0 <= value <= 64.0
+                for value in self.compression_ratios
+            )
+        ):
+            raise ValueError(
+                "compression_ratios must contain unique values between 1 and 64"
+            )
         if min(self.formal_max_new_tokens, self.reasoning_max_new_tokens, self.mechanism_count) <= 0:
             raise ValueError("generation and mechanism counts must be positive")
         if not self.formal_tasks or not self.mechanism_tasks or not self.models:
@@ -117,6 +140,8 @@ def as_dict(config: E4Config) -> dict[str, Any]:
     return {
         "seed": config.seed,
         "visual_token_cap": config.visual_token_cap,
+        "compression_ratio": config.compression_ratio,
+        "compression_ratios": list(config.compression_ratios),
         "formal_max_new_tokens": config.formal_max_new_tokens,
         "reasoning_max_new_tokens": config.reasoning_max_new_tokens,
         "mechanism_count": config.mechanism_count,

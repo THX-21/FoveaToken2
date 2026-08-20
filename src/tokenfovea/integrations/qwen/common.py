@@ -129,6 +129,28 @@ def attention(
     return output.transpose(1, 2).contiguous(), weights
 
 
+def compact_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    groups: int,
+    scaling: float,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Attend to a compact KV sequence using an explicit original-position mask."""
+    output = F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask.to(query.device),
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scaling,
+        enable_gqa=groups > 1,
+    )
+    return output.transpose(1, 2).contiguous()
+
+
 def visual_attention_signal(
     query: torch.Tensor,
     visual_keys: torch.Tensor,

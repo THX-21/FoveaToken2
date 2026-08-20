@@ -74,11 +74,13 @@ class FoveaSession:
         self.pyramids: dict[int, LayerKVPyramid] = {}
         self.visual_positions: list[int] = []
         self.prompt_text_positions: list[int] = []
+        self.post_visual_positions: list[int] = []
         self.fine_position_ids: torch.Tensor | None = None
         self.current_position_ids: torch.Tensor | None = None
         self.prompt_length = 0
         self.prompt_signal_sum: torch.Tensor | None = None
         self.prompt_signal_count = 0
+        self.prefill_route_complete = False
         self.step_signal_sum: torch.Tensor | None = None
         self.step_signal_count = 0
         self.ema_leaf_scores: torch.Tensor | None = None
@@ -168,6 +170,9 @@ class FoveaSession:
             and (self.selected_heads is None or layer_idx in self.selected_heads)
         )
 
+    def needs_prefill_signal(self, layer_idx: int) -> bool:
+        return not self.prefill_route_complete and self.needs_signal(layer_idx)
+
     def is_prefill_layer(self, layer_idx: int) -> bool:
         if self.native_capture_scale is not None:
             return layer_idx not in self.native_sources[self.native_capture_scale]
@@ -207,6 +212,12 @@ class FoveaSession:
         self.visual_positions = [i for i, token_id in enumerate(token_ids) if token_id == image_token_id]
         visual_set = set(self.visual_positions)
         self.prompt_text_positions = [i for i in range(len(token_ids)) if i not in visual_set]
+        last_visual = max(self.visual_positions)
+        self.post_visual_positions = [
+            position for position in self.prompt_text_positions if position > last_visual
+        ]
+        if not self.post_visual_positions:
+            raise ValueError("TokenFovea prompt has no text query after the image")
         grids = []
         for temporal, height, width in image_grid_thw.detach().cpu().tolist():
             if int(temporal) != 1:
@@ -282,7 +293,14 @@ class FoveaSession:
         assert self.forest is not None
         self.topology = topology
         self._routing_device = device
-        initial = self._index(sorted(self.forest.initial_front(self.config.budget)), device)
+        initial_ids = sorted(self.forest.initial_front(self.config.budget))
+        if len(initial_ids) != self.config.budget:
+            raise RuntimeError(
+                f"TokenFovea initial front has {len(initial_ids)} nodes, "
+                f"expected budget {self.config.budget}"
+            )
+        self.forest.validate_front(initial_ids)
+        initial = self._index(initial_ids, device)
         self.router = SplitMergeRouter(
             topology,
             initial,
@@ -377,8 +395,90 @@ class FoveaSession:
                 signal, count = reduced
                 self.prompt_signal_sum = self._accumulate_signal(self.prompt_signal_sum, signal)
                 self.prompt_signal_count += count
-        if layer_idx == self.last_routed_layer and self.dynamic:
+
+    def compose_prefill(
+        self,
+        layer_idx: int,
+        full_keys: torch.Tensor,
+        full_values: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compose the initialized visual front for post-image prompt queries."""
+        if (
+            self.router is None
+            or layer_idx not in self.pyramids
+            or self.position_encoder is None
+            or self.rotate_key is None
+        ):
+            raise RuntimeError("TokenFovea prefill front is not initialized")
+        active_ids = self.router.active_ids().to(full_keys.device)
+        anchors = (
+            self._anchor_positions(active_ids, full_keys.device)
+            if self.config.position_mode == "text_anchor"
+            else None
+        )
+        visual_keys, visual_values = self.pyramids[layer_idx].gather(
+            active_ids,
+            self.config.position_mode,
+            self.rotate_key,
+            self.position_encoder,
+            reference,
+            anchors,
+        )
+        if anchors is not None:
+            self._decode_anchor_positions.clear()
+        text_index = self._index(self.prompt_text_positions, full_keys.device)
+        text_keys = full_keys.index_select(-2, text_index)
+        text_values = full_values.index_select(-2, text_index)
+        query_index = self._index(self.post_visual_positions, full_keys.device)
+        key_positions = torch.cat(
+            (
+                torch.full(
+                    (active_ids.numel(),),
+                    max(self.visual_positions),
+                    dtype=torch.long,
+                    device=full_keys.device,
+                ),
+                text_index,
+            )
+        )
+        mask = key_positions[None, :] <= query_index[:, None]
+        return (
+            torch.cat((visual_keys, text_keys), dim=-2),
+            torch.cat((visual_values, text_values), dim=-2),
+            query_index,
+            mask[None, None],
+            active_ids,
+        )
+
+    def record_prefill_layer(
+        self,
+        layer_idx: int,
+        visual_attention: torch.Tensor | None,
+        active_ids: torch.Tensor,
+    ) -> None:
+        """Accumulate initialized-front signals, then route once prefill is complete."""
+        if visual_attention is not None:
+            reduced = self._reduce_signal(layer_idx, visual_attention)
+            if reduced is not None:
+                active_scores, count = reduced
+                if (
+                    self.router is None
+                    or self.topology is None
+                    or self._routing_device is None
+                ):
+                    raise RuntimeError("TokenFovea prefill router is not initialized")
+                _, leaf_scores = self.router.scores_from_active(
+                    active_ids.to(self._routing_device),
+                    active_scores,
+                )
+                self.prompt_signal_sum = self._accumulate_signal(
+                    self.prompt_signal_sum, leaf_scores
+                )
+                self.prompt_signal_count += count
+        if layer_idx == self.last_routed_layer and not self.prefill_route_complete:
             self._finish_prefill()
+            self.prefill_route_complete = True
 
     def _finish_prefill(self) -> None:
         if (

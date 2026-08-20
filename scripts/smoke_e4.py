@@ -9,7 +9,7 @@ from PIL import Image
 
 from experiments.e4.conditions import conditions_for_suite
 from experiments.e4.evaluator import parse_reasoning_response
-from experiments.e4.image import aligned_high_resolution, scaled_plan, visual_tokens
+from experiments.e4.image import aligned_high_resolution, matched_budget_plan, visual_tokens
 from experiments.e4.runtime import RouteTraceObserver, validate_head_selection
 from tokenfovea.session import RouteEvent
 from tokenfovea.topology import VisualTokenForest
@@ -17,7 +17,8 @@ from tokenfovea.topology import VisualTokenForest
 
 def main() -> None:
     plan = aligned_high_resolution(Image.new("RGB", (2048, 1024)), 28, 200704, 4096)
-    assert visual_tokens(scaled_plan(plan, 4)) == visual_tokens(plan) // 16
+    budget = matched_budget_plan([plan], 8.0)
+    assert visual_tokens(budget.lowres_plans[0]) == budget.target_tokens
     assert len(conditions_for_suite("formal")) == 6
     forest = VisualTokenForest.from_aligned_grids([(8, 8)])
     observer = RouteTraceObserver()

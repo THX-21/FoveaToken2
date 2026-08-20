@@ -16,9 +16,10 @@ def _encoder(reference, positions):
 
 
 class E2SessionTest(unittest.TestCase):
-    def test_only_perstep_conditions_preserve_full_prefill(self):
-        self.assertTrue(E2Session(get_condition("random_perstep_kv_center")).preserve_prefill)
-        self.assertFalse(E2Session(get_condition("random_fixed_kv_center")).preserve_prefill)
+    def test_perstep_conditions_initialize_a_compact_prompt_front(self):
+        session = self._session("random_perstep_kv_center")
+        self.assertIsNotNone(session.fixed_front)
+        self.assertFalse(session.prefill_boundary_complete)
 
     def test_native_auxiliary_banks_feed_uniform_front(self):
         session = E2Session(get_condition("native_uniform4"))
@@ -61,8 +62,11 @@ class E2SessionTest(unittest.TestCase):
     def test_fixed_front_is_shared_by_prefill_and_decode(self):
         session = self._session("random_fixed_kv_center")
         front_hash = session.fixed_front.digest()
+        session.finish_prefill_layer(session.last_routed_layer)
 
         self.assertEqual(session.fixed_front.digest(), front_hash)
+        self.assertIsNone(session.step_front)
+        self.assertFalse(session.prefill_boundary_complete)
         self.assertEqual(session.decode_step, 0)
 
     def test_perstep_front_shared_across_layers_then_changes(self):
@@ -73,9 +77,15 @@ class E2SessionTest(unittest.TestCase):
         hidden = torch.zeros(1, 67, 1)
         for layer in (0, 4):
             session.capture_layer(layer, raw, values, rotated, hidden, None)
+            self.assertIsNotNone(session.prefill_compact(layer, raw, values, raw))
+            session.finish_prefill_layer(layer)
+        self.assertTrue(session.prefill_boundary_complete)
+        boundary_hash = session.step_front.digest()
+        self.assertNotEqual(boundary_hash, session.fixed_front.digest())
         full_keys = torch.arange(67, dtype=torch.float32).view(1, 1, 67, 1)
         first = session.decode_compact(0, full_keys, full_keys, raw)
         first_hash = session.step_front.digest()
+        self.assertEqual(first_hash, boundary_hash)
         session.finish_layer(0)
         session.decode_compact(4, full_keys, full_keys, raw)
         self.assertEqual(session.step_front.digest(), first_hash)

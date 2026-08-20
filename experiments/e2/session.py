@@ -140,10 +140,6 @@ class E2Session:
     def configured(self) -> bool:
         return bool(self.visual_positions) or self.native_capture_scale is not None
 
-    @property
-    def preserve_prefill(self) -> bool:
-        return self.condition.front_mode == "random_perstep"
-
     def attach(
         self,
         layers: list[int],
@@ -170,6 +166,7 @@ class E2Session:
         self.step_front: BlockFront | None = None
         self.last_front: BlockFront | None = None
         self.decode_step = 0
+        self.prefill_boundary_complete = False
         self.prompt_length = 0
         self.native_capture_scale: int | None = None
         self.native_capture_positions: list[int] = []
@@ -241,7 +238,7 @@ class E2Session:
         self._forward_started = None
 
     def diagnostics(self) -> dict[str, Any]:
-        front = self.fixed_front or self.step_front or self.last_front
+        front = self.last_front or self.step_front or self.fixed_front
         return {
             "sample_id": self.pending_sample_id,
             "grid": list(self.grid or ()),
@@ -299,7 +296,7 @@ class E2Session:
         if self.condition.front_mode == "uniform":
             assert self.condition.block_size is not None
             self.fixed_front = BlockFront.uniform(height, width, self.condition.block_size)
-        elif self.condition.front_mode == "random_fixed":
+        elif self.condition.front_mode in {"random_fixed", "random_perstep"}:
             self.fixed_front = self._random_front(None)
         self._trace("prompt", self.fixed_front)
 
@@ -416,6 +413,18 @@ class E2Session:
         self.last_front = front
         keys, values, _, mask = self._compact(layer, front, full_keys, full_values, reference, prefill=False)
         return keys, values, mask
+
+    def finish_prefill_layer(self, layer: int) -> None:
+        """Advance a per-step random front at the prompt-prefix boundary."""
+        if (
+            self.native_capture_scale is None
+            and self.condition.front_mode == "random_perstep"
+            and layer == self.last_routed_layer
+            and not self.prefill_boundary_complete
+        ):
+            self.step_front = self._random_front(0)
+            self.prefill_boundary_complete = True
+            self._trace("prefill_route", self.step_front)
 
     def finish_layer(self, layer: int) -> None:
         if layer == self.last_routed_layer:

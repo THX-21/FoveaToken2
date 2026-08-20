@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import json
+import os
 import re
 import time
 from contextlib import contextmanager
@@ -9,26 +11,40 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
+from dotenv import load_dotenv
 from PIL import Image
 from tqdm import tqdm  # type: ignore[import-untyped]
 
 from experiments.distributed import distributed_context, merge_rank_jsonl, merge_rank_text
 from experiments.local_datasets import use_local_lmms_datasets
 from tokenfovea.config import FoveaConfig
+from tokenfovea.generation import (
+    generate_with_prefill_boundary as _generate_with_routed_prompt,
+    prompt_prefix_inputs as _prompt_prefix_inputs,
+)
 from tokenfovea.integrations.qwen import install_tokenfovea
 from tokenfovea.session import FoveaSession
 
 from .conditions import Condition, Suite
 from .config import E4Config
 from .data import suite_indices
-from .image import aligned_high_resolution, resize, scaled_plan, visual_tokens
+from .image import (
+    aligned_high_resolution,
+    matched_budget_plan,
+    resize,
+    scaled_plan,
+    visual_tokens,
+)
 from .runtime import ForwardTimer, RouteTraceObserver
 from .session import E4Session
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 REASONING_PROMPT = (
     "Analyze the image and question carefully. Give only the evidence needed in at most "
     "200 words, then put the final answer alone inside <answer>...</answer>."
 )
+NATIVE_PREFILL_PROTOCOL = 6
 
 
 def load_tasks(model_name: str, task_names: tuple[str, ...]) -> dict[str, Any]:
@@ -46,8 +62,43 @@ def load_tasks(model_name: str, task_names: tuple[str, ...]) -> dict[str, Any]:
             loaded = {}
             for name in task_names:
                 task = get_task_dict([name], manager, "simple")[name]
-                loaded[name] = task[1] if isinstance(task, tuple) else task
+                task = task[1] if isinstance(task, tuple) else task
+                if name == "hrbench8k":
+                    _configure_hrbench_judge(task)
+                loaded[name] = task
             return loaded
+
+
+def _configure_hrbench_judge(task: Any) -> None:
+    """Apply the E3-style .env credentials to HRBench's requests-based judge."""
+    process_results = task.config.process_results
+    hrbench_evaluator = process_results.__globals__["hrbench_evaluator"]
+
+    if key := os.getenv("OPENAI_API_KEY"):
+        hrbench_evaluator.api_key = key
+    if model := os.getenv("MODEL_VERSION"):
+        hrbench_evaluator.gpt_model = model
+    if url := os.getenv("OPENAI_API_URL"):
+        hrbench_evaluator.API_URL = _chat_completions_url(url)
+    if not hasattr(hrbench_evaluator, "_e4_original_post_request"):
+        original_post_request = hrbench_evaluator._post_request
+
+        def post_request(payload: dict[str, Any]) -> dict[str, Any]:
+            payload = dict(payload)
+            payload["thinking"] = {
+                "type": os.getenv("JUDGE_THINKING", "disabled")
+            }
+            if max_tokens := os.getenv("JUDGE_MAX_TOKENS"):
+                payload["max_tokens"] = int(max_tokens)
+            return original_post_request(payload)
+
+        hrbench_evaluator._e4_original_post_request = original_post_request
+        hrbench_evaluator._post_request = post_request
+
+
+def _chat_completions_url(url: str) -> str:
+    url = url.rstrip("/")
+    return url if url.endswith("/chat/completions") else f"{url}/chat/completions"
 
 
 @contextmanager
@@ -140,7 +191,12 @@ def evaluate_condition(
         for task, task_indices in indices.items()
         for source_index in task_indices
     }
-    completed = _read_samples(sample_path, expected_ids)
+    completed = _read_samples(
+        sample_path,
+        expected_ids,
+        native_prefill_protocol=(NATIVE_PREFILL_PROTOCOL if condition.native else None),
+        compression_ratio=condition.compression_ratio,
+    )
     if result_path.exists() and len(completed) == len(expected_ids):
         return json.loads(result_path.read_text(encoding="utf-8"))
     if distributed.is_main and result_path.exists():
@@ -184,16 +240,14 @@ def evaluate_condition(
             ):
                 doc = task.eval_docs[source_index]
                 sample_id = f"{current_task}:{source_index}"
-                prompt = str(task.doc_to_text(doc))
-                if suite != "formal":
-                    prompt = f"{prompt.rstrip()}\n\n{REASONING_PROMPT}"
+                prompt = _suite_prompt(str(task.doc_to_text(doc)), suite)
                 visuals = task.doc_to_visual(doc)
                 if (
                     not isinstance(visuals, list)
-                    or len(visuals) != 1
-                    or not isinstance(visuals[0], Image.Image)
+                    or not visuals
+                    or any(not isinstance(image, Image.Image) for image in visuals)
                 ):
-                    raise ValueError("E4 requires exactly one PIL image per sample")
+                    raise ValueError("E4 requires one or more PIL images per sample")
                 observer.begin_sample(sample_id)
                 timer.reset()
                 prediction, record, traces = _generate(
@@ -206,7 +260,7 @@ def evaluate_condition(
                     timer,
                     observer,
                     sample_id,
-                    visuals[0],
+                    visuals,
                     prompt,
                     task.get_config("generation_kwargs") or {},
                 )
@@ -233,7 +287,14 @@ def evaluate_condition(
         if distributed.is_main:
             merge_rank_jsonl(sample_path, key="sample_id")
             merge_rank_text(trace_path)
-            completed = _read_samples(sample_path, expected_ids)
+            completed = _read_samples(
+                sample_path,
+                expected_ids,
+                native_prefill_protocol=(
+                    NATIVE_PREFILL_PROTOCOL if condition.native else None
+                ),
+                compression_ratio=condition.compression_ratio,
+            )
             if len(completed) == len(expected_ids):
                 payload = _aggregate(
                     config, model_name, condition, suite, tasks, indices, completed
@@ -266,21 +327,31 @@ def _generate(
     timer: ForwardTimer,
     observer: RouteTraceObserver,
     sample_id: str,
-    image: Image.Image,
+    images: list[Image.Image],
     prompt: str,
     generation_kwargs: dict[str, Any],
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     spec = config.models[model_name]
-    high = aligned_high_resolution(
-        image, spec.pixel_per_token, spec.min_pixels, config.visual_token_cap
+    high_plans = [
+        aligned_high_resolution(
+            image, spec.pixel_per_token, spec.min_pixels, config.visual_token_cap
+        )
+        for image in images
+    ]
+    high_tokens = sum(visual_tokens(plan) for plan in high_plans)
+    requested_ratio = condition.compression_ratio or config.compression_ratio
+    budget_plan = matched_budget_plan(high_plans, requested_ratio)
+    target_tokens = budget_plan.target_tokens
+    input_plans = (
+        list(budget_plan.lowres_plans)
+        if condition.kind == "lowres"
+        else high_plans
     )
-    high_tokens = visual_tokens(high)
-    target_tokens = high_tokens // condition.budget_area
-    input_plan = scaled_plan(high, condition.lowres_divisor or 1)
-    if condition.kind == "lowres" and visual_tokens(input_plan) != target_tokens:
+    input_tokens = sum(visual_tokens(plan) for plan in input_plans)
+    if condition.kind == "lowres" and input_tokens != target_tokens:
         raise ValueError(
             f"E4 LowRes/Native target mismatch for {sample_id}: "
-            f"{visual_tokens(input_plan)} != {target_tokens}"
+            f"{input_tokens} != {target_tokens}"
         )
     if condition.kind == "full":
         target_tokens = high_tokens
@@ -290,9 +361,16 @@ def _generate(
         session.begin_native_sample()
         try:
             for divisor, area_scale in ((2, 4), (4, 16), (8, 64)):
-                auxiliary_plan = scaled_plan(high, divisor)
+                auxiliary_plans = [scaled_plan(plan, divisor) for plan in high_plans]
                 auxiliary = _prepare_inputs(
-                    lm, model_name, resize(image, auxiliary_plan), prompt, auxiliary_plan
+                    lm,
+                    model_name,
+                    [
+                        resize(image, plan)
+                        for image, plan in zip(images, auxiliary_plans)
+                    ],
+                    prompt,
+                    auxiliary_plans,
                 )
                 session.begin_native_capture(area_scale)
                 with torch.inference_mode():
@@ -303,12 +381,12 @@ def _generate(
             session.abort_native_sample()
             raise
 
-    prepared = resize(image, input_plan)
-    inputs = _prepare_inputs(lm, model_name, prepared, prompt, input_plan)
+    prepared = [resize(image, plan) for image, plan in zip(images, input_plans)]
+    inputs = _prepare_inputs(lm, model_name, prepared, prompt, input_plans)
     task_limit = int(generation_kwargs.get("max_new_tokens", config.formal_max_new_tokens))
     max_new_tokens = (
         config.reasoning_max_new_tokens
-        if suite != "formal"
+        if suite == "reasoning"
         else min(task_limit, config.formal_max_new_tokens)
     )
     kwargs = {
@@ -323,7 +401,11 @@ def _generate(
         torch.cuda.synchronize()
     started = time.perf_counter()
     with torch.inference_mode():
-        output = lm.model.generate(**inputs, **kwargs)
+        output = (
+            _generate_with_routed_prompt(lm.model, inputs, kwargs)
+            if condition.routed
+            else lm.model.generate(**inputs, **kwargs)
+        )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     generation_seconds = time.perf_counter() - started
@@ -339,12 +421,12 @@ def _generate(
         if term:
             raw = raw.split(term)[0].strip()
     prediction, analysis, compliant = (
-        parse_reasoning_response(raw) if suite != "formal" else (raw, "", True)
+        parse_reasoning_response(raw) if suite == "reasoning" else (raw, "", True)
     )
     score_tokens = [int(scores[0].argmax()) for scores in output.scores]
     traces = observer.drain()
     final_front = _final_front(session)
-    active_tokens = len(final_front) if final_front else visual_tokens(input_plan)
+    active_tokens = len(final_front) if final_front else input_tokens
     if active_tokens != target_tokens:
         raise RuntimeError(
             f"E4 condition {condition.name} changed its fixed budget: {active_tokens} != {target_tokens}"
@@ -356,20 +438,43 @@ def _generate(
     )
     record = {
         "sample_id": sample_id,
+        "native_prefill_protocol": (
+            NATIVE_PREFILL_PROTOCOL if condition.native else None
+        ),
         "raw_prediction": raw,
         "analysis": analysis,
         "analysis_word_count": len(analysis.split()),
         "format_compliant": compliant,
-        "original_size": list(image.size),
-        "input_size": [input_plan.width, input_plan.height],
-        "highres_grid": [high.grid_height, high.grid_width],
-        "input_grid": [input_plan.grid_height, input_plan.grid_width],
+        "image_count": len(images),
+        "original_size": _one_or_many([list(image.size) for image in images]),
+        "input_size": _one_or_many(
+            [[plan.width, plan.height] for plan in input_plans]
+        ),
+        "highres_grid": _one_or_many(
+            [[plan.grid_height, plan.grid_width] for plan in high_plans]
+        ),
+        "input_grid": _one_or_many(
+            [[plan.grid_height, plan.grid_width] for plan in input_plans]
+        ),
         "highres_visual_tokens": high_tokens,
-        "visual_tokens": visual_tokens(input_plan),
+        "visual_tokens": input_tokens,
+        "configured_compression_ratio": requested_ratio,
+        "theoretical_target_visual_tokens": (
+            high_tokens if condition.kind == "full" else budget_plan.theoretical_tokens
+        ),
         "target_visual_tokens": target_tokens,
+        "budget_relative_error": (
+            0.0 if condition.kind == "full" else budget_plan.relative_budget_error
+        ),
+        "max_lowres_aspect_log_error": (
+            None if condition.kind == "full" else budget_plan.max_aspect_log_error
+        ),
+        "prefill_active_tokens": target_tokens if condition.native else input_tokens,
         "active_tokens": active_tokens,
-        "compression_ratio": active_tokens / high_tokens,
-        "retained_main_visual_tokens": high_tokens if condition.native else visual_tokens(input_plan),
+        "compression_ratio": high_tokens / active_tokens,
+        "achieved_compression_ratio": high_tokens / active_tokens,
+        "token_retention_ratio": active_tokens / high_tokens,
+        "retained_main_visual_tokens": high_tokens if condition.native else input_tokens,
         "native_bank_tokens": native_bank_tokens,
         "generated_token_ids": generated.detach().cpu().tolist(),
         "score_top1_token_ids": score_tokens,
@@ -391,9 +496,9 @@ def _generate(
 def _prepare_inputs(
     lm: Any,
     model_name: str,
-    image: Image.Image,
+    images: list[Image.Image],
     prompt: str,
-    plan: Any,
+    plans: list[Any],
 ) -> Any:
     messages = []
     if getattr(lm, "system_prompt", None):
@@ -402,7 +507,7 @@ def _prepare_inputs(
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                *({"type": "image", "image": image} for image in images),
                 {"type": "text", "text": prompt},
             ],
         }
@@ -412,17 +517,32 @@ def _prepare_inputs(
         template_kwargs["enable_thinking"] = False
     text = lm.processor.apply_chat_template(messages, **template_kwargs)
     inputs = lm.processor(
-        text=[text], images=[image], do_resize=False, return_tensors="pt"
+        text=[text], images=images, do_resize=False, return_tensors="pt"
     ).to(lm.device)
     merge = int(lm.model.config.vision_config.spatial_merge_size)
-    actual = tuple(int(value) for value in inputs["image_grid_thw"][0].tolist())
-    expected = (1, plan.grid_height * merge, plan.grid_width * merge)
+    actual = [tuple(int(value) for value in row) for row in inputs["image_grid_thw"].tolist()]
+    expected = [
+        (1, plan.grid_height * merge, plan.grid_width * merge) for plan in plans
+    ]
     if actual != expected:
-        raise ValueError(f"E4 processor grid {actual} does not match planned grid {expected}")
+        raise ValueError(f"E4 processor grids {actual} do not match planned grids {expected}")
     image_tokens = int((inputs["input_ids"] == lm.model.config.image_token_id).sum())
-    if image_tokens != visual_tokens(plan):
-        raise ValueError(f"E4 input contains {image_tokens} visual tokens, expected {visual_tokens(plan)}")
+    expected_tokens = sum(visual_tokens(plan) for plan in plans)
+    if image_tokens != expected_tokens:
+        raise ValueError(
+            f"E4 input contains {image_tokens} visual tokens, expected {expected_tokens}"
+        )
     return inputs
+
+
+def _one_or_many(values: list[Any]) -> Any:
+    return values[0] if len(values) == 1 else values
+
+
+def _suite_prompt(prompt: str, suite: Suite) -> str:
+    if suite == "reasoning":
+        return f"{prompt.rstrip()}\n\n{REASONING_PROMPT}"
+    return prompt
 
 
 def parse_reasoning_response(raw: str) -> tuple[str, str, bool]:
@@ -469,6 +589,7 @@ def _aggregate(
 ) -> dict[str, Any]:
     task_results: dict[str, dict[str, Any]] = {}
     for task_name, task_indices in indices.items():
+        task = tasks[task_name]
         rows = [samples[f"{task_name}:{index}"] for index in task_indices]
         if len(rows) != len(task_indices):
             raise RuntimeError(f"E4 {condition.name}/{task_name} has incomplete results")
@@ -476,12 +597,24 @@ def _aggregate(
         for row in rows:
             for metric, value in row["metrics"].items():
                 values.setdefault(metric, []).append(value)
-        aggregators = tasks[task_name].aggregation()
+        aggregators = task.aggregation()
         metrics = {}
         for metric, metric_values in values.items():
+            if metric == "submission":
+                continue
             aggregator = aggregators.get(metric)
-            result = aggregator(metric_values) if aggregator is not None else sum(metric_values) / len(metric_values)
-            metrics[metric] = float(result)
+            if aggregator is None:
+                if not all(isinstance(value, (int, float)) for value in metric_values):
+                    continue
+                result = sum(metric_values) / len(metric_values)
+            elif "args" in inspect.signature(aggregator).parameters:
+                result = aggregator(metric_values, args=getattr(task, "args", None))
+            else:
+                result = aggregator(metric_values)
+            value = float(result)
+            if task_name == "vstar_bench":
+                value /= 100.0
+            metrics[metric] = value
         primary = config.primary_metrics[task_name]
         if primary not in metrics:
             raise ValueError(f"E4 task {task_name} did not return primary metric {primary}")
@@ -520,7 +653,13 @@ def _aggregate(
     }
 
 
-def _read_samples(path: Path, expected_ids: set[str]) -> dict[str, dict[str, Any]]:
+def _read_samples(
+    path: Path,
+    expected_ids: set[str],
+    *,
+    native_prefill_protocol: int | None = None,
+    compression_ratio: float | None = None,
+) -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
     rows = {}
@@ -537,11 +676,31 @@ def _read_samples(path: Path, expected_ids: set[str]) -> dict[str, dict[str, Any
         sample_id = row.get("sample_id")
         if sample_id not in expected_ids or sample_id in rows:
             raise ValueError(f"invalid or duplicate E4 sample ID: {sample_id!r}")
+        if (
+            native_prefill_protocol is not None
+            and row.get("native_prefill_protocol") != native_prefill_protocol
+        ):
+            raise ValueError(
+                f"E4 sample {sample_id!r} uses an obsolete Native prefill protocol; "
+                "archive or remove this condition directory before rerunning"
+            )
+        if compression_ratio is not None and row.get(
+            "configured_compression_ratio"
+        ) != compression_ratio:
+            raise ValueError(
+                f"E4 sample {sample_id!r} uses an obsolete compression-ratio protocol; "
+                "archive or remove this condition directory before rerunning"
+            )
         rows[sample_id] = row
     return rows
 
 
 def _metric_correct(metrics: dict[str, Any]) -> bool | None:
+    for value in metrics.values():
+        if isinstance(value, dict) and "pred_answer" in value and "answer" in value:
+            predicted = set(str(value["pred_answer"]).strip())
+            target = set(str(value["answer"]).strip())
+            return predicted == target
     numeric = list(_score_leaves(metrics))
     return max(numeric) > 0 if numeric else None
 

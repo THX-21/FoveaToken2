@@ -15,6 +15,7 @@ from experiments.distributed import (
     merge_rank_text,
 )
 from experiments.local_datasets import use_local_lmms_datasets
+from tokenfovea.generation import generate_with_prefill_boundary
 
 from .conditions import Condition
 from .config import E2Config, ModelSpec
@@ -23,6 +24,8 @@ from .front import BlockFront, stable_seed
 from .image import aligned_high_resolution, lowres_plan, matched_lowres_plan, resize
 from .patch import install_e2
 from .session import E2Session
+
+RANDOM_PERSTEP_PREFILL_PROTOCOL = "compact_prefix_boundary_v1"
 
 
 def evaluate_condition(
@@ -52,7 +55,15 @@ def evaluate_condition(
         for task_name, indices in task_indices.items()
         for source_index in indices
     }
-    completed_samples = _read_completed_samples(sample_path, expected_sample_ids)
+    completed_samples = _read_completed_samples(
+        sample_path,
+        expected_sample_ids,
+        required_prefill_protocol=(
+            RANDOM_PERSTEP_PREFILL_PROTOCOL
+            if condition.front_mode == "random_perstep"
+            else None
+        ),
+    )
     if result_path.exists() and len(completed_samples) == len(expected_sample_ids):
         return json.loads(result_path.read_text(encoding="utf-8"))
     if distributed.is_main and result_path.exists():
@@ -122,7 +133,15 @@ def evaluate_condition(
         if distributed.is_main:
             merge_rank_jsonl(sample_path, key="sample_id")
             merge_rank_text(trace_path)
-            completed = _read_completed_samples(sample_path, expected_sample_ids)
+            completed = _read_completed_samples(
+                sample_path,
+                expected_sample_ids,
+                required_prefill_protocol=(
+                    RANDOM_PERSTEP_PREFILL_PROTOCOL
+                    if condition.front_mode == "random_perstep"
+                    else None
+                ),
+            )
             payload = _aggregate_condition(
                 config,
                 model_name,
@@ -192,7 +211,12 @@ def _aggregate_condition(
     }
 
 
-def _read_completed_samples(path: Path, expected_ids: set[str]) -> dict[str, dict[str, Any]]:
+def _read_completed_samples(
+    path: Path,
+    expected_ids: set[str],
+    *,
+    required_prefill_protocol: str | None = None,
+) -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
     completed: dict[str, dict[str, Any]] = {}
@@ -213,6 +237,14 @@ def _read_completed_samples(path: Path, expected_ids: set[str]) -> dict[str, dic
             raise ValueError(f"duplicate E2 sample ID in {path}: {sample_id!r}")
         if not isinstance(row.get("metrics"), dict):
             raise ValueError(f"missing E2 metrics in {path}: {sample_id!r}")
+        if (
+            required_prefill_protocol is not None
+            and row.get("prefill_protocol") != required_prefill_protocol
+        ):
+            raise ValueError(
+                f"obsolete E2 random-per-step prefill protocol in {path}; "
+                "move or remove this condition directory before rerunning"
+            )
         completed[sample_id] = row
     return completed
 
@@ -287,7 +319,11 @@ def _generate(
         torch.cuda.synchronize()
     started = time.perf_counter()
     with torch.inference_mode():
-        output = lm.model.generate(**inputs, **kwargs)
+        output = (
+            generate_with_prefill_boundary(lm.model, inputs, kwargs)
+            if condition.front_mode == "random_perstep"
+            else lm.model.generate(**inputs, **kwargs)
+        )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
@@ -316,6 +352,8 @@ def _generate(
             "total_seconds": elapsed,
         }
     )
+    if condition.front_mode == "random_perstep":
+        diagnostics["prefill_protocol"] = RANDOM_PERSTEP_PREFILL_PROTOCOL
     if diagnostics["active_tokens"] is None:
         diagnostics["active_tokens"] = plan.visual_tokens
         diagnostics["compression_ratio"] = plan.visual_tokens / high.visual_tokens

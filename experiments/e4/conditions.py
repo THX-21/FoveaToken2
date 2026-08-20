@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -11,7 +12,7 @@ Kind = Literal["full", "lowres", "uniform", "static", "dynamic"]
 class Condition:
     name: str
     kind: Kind
-    budget_divisor: int
+    compression_ratio: float | None = None
     use_top8: bool = False
 
     @property
@@ -22,50 +23,78 @@ class Condition:
     def routed(self) -> bool:
         return self.kind in {"static", "dynamic"}
 
-    @property
-    def lowres_divisor(self) -> int | None:
-        return self.budget_divisor if self.kind == "lowres" else None
 
-    @property
-    def budget_area(self) -> int:
-        return self.budget_divisor**2
+def ratio_label(compression_ratio: float) -> str:
+    if not math.isfinite(compression_ratio) or compression_ratio <= 0:
+        raise ValueError("compression ratio must be finite and positive")
+    return f"{compression_ratio:g}".replace(".", "p")
 
 
-FORMAL_CONDITIONS = (
-    Condition("full", "full", 1),
-    Condition("lowres4", "lowres", 4),
-    Condition("uniform4_native", "uniform", 4),
-    Condition("prefill_static_top8_native", "static", 4, use_top8=True),
-    Condition("dynamic_top8_native", "dynamic", 4, use_top8=True),
-    Condition("dynamic_all_heads_native", "dynamic", 4),
-)
-
-COMPRESSION_CONDITIONS = (
-    Condition("lowres2", "lowres", 2),
-    Condition("uniform2_native", "uniform", 2),
-    Condition("prefill_static2_top8_native", "static", 2, use_top8=True),
-    Condition("dynamic2_top8_native", "dynamic", 2, use_top8=True),
-)
-
-ALL_CONDITIONS = FORMAL_CONDITIONS + COMPRESSION_CONDITIONS
-CONDITION_BY_NAME = {condition.name: condition for condition in ALL_CONDITIONS}
-
-
-def conditions_for_suite(suite: Suite) -> tuple[Condition, ...]:
+def conditions_for_suite(
+    suite: Suite,
+    compression_ratio: float = 8.0,
+    compression_ratios: tuple[float, ...] = (2.0, 4.0, 6.0, 8.0, 16.0),
+) -> tuple[Condition, ...]:
     if suite in {"formal", "reasoning"}:
-        return FORMAL_CONDITIONS
+        return (
+            Condition("full", "full"),
+            *_ratio_conditions(compression_ratio),
+            Condition(
+                f"dynamic{ratio_label(compression_ratio)}_all_heads_native",
+                "dynamic",
+                compression_ratio,
+            ),
+        )
     if suite == "compression":
-        return COMPRESSION_CONDITIONS
+        return tuple(
+            condition
+            for ratio in compression_ratios
+            for condition in _ratio_conditions(ratio)
+        )
     raise ValueError(f"unsupported E4 suite: {suite}")
 
 
-def get_condition(name: str, suite: Suite | None = None) -> Condition:
+def _ratio_conditions(compression_ratio: float) -> tuple[Condition, ...]:
+    label = ratio_label(compression_ratio)
+    return (
+        Condition(f"lowres{label}", "lowres", compression_ratio),
+        Condition(f"uniform{label}_native", "uniform", compression_ratio),
+        Condition(
+            f"prefill_static{label}_top8_native",
+            "static",
+            compression_ratio,
+            use_top8=True,
+        ),
+        Condition(
+            f"dynamic{label}_top8_native",
+            "dynamic",
+            compression_ratio,
+            use_top8=True,
+        ),
+    )
+
+
+def get_condition(
+    name: str,
+    suite: Suite | None = None,
+    compression_ratio: float = 8.0,
+    compression_ratios: tuple[float, ...] = (2.0, 4.0, 6.0, 8.0, 16.0),
+) -> Condition:
+    suites: tuple[Suite, ...] = (
+        (suite,) if suite is not None else ("formal", "compression")
+    )
+    available = {
+        condition.name: condition
+        for selected_suite in suites
+        for condition in conditions_for_suite(
+            selected_suite,
+            compression_ratio,
+            compression_ratios,
+        )
+    }
     try:
-        condition = CONDITION_BY_NAME[name]
+        return available[name]
     except KeyError as error:
         raise ValueError(
-            f"unknown E4 condition {name!r}; choose from {sorted(CONDITION_BY_NAME)}"
+            f"unknown E4 condition {name!r}; choose from {sorted(available)}"
         ) from error
-    if suite is not None and condition not in conditions_for_suite(suite):
-        raise ValueError(f"condition {name!r} is not part of E4 suite {suite!r}")
-    return condition

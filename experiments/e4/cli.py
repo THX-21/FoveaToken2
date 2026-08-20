@@ -20,6 +20,11 @@ def main(argv: list[str] | None = None) -> None:
         child.add_argument("--config", default=DEFAULT_CONFIG)
         if command != "prepare":
             child.add_argument("--model", choices=("qwen25", "qwen35"), required=True)
+            child.add_argument(
+                "--compression-ratio",
+                type=float,
+                help="override the configured high-res/active visual token ratio",
+            )
         if command == "run":
             child.add_argument(
                 "--suite",
@@ -36,6 +41,10 @@ def main(argv: list[str] | None = None) -> None:
             )
     args = parser.parse_args(argv)
     config = E4Config.load(args.config)
+    if args.command != "prepare" and args.compression_ratio is not None:
+        config.compression_ratio = args.compression_ratio
+        config.compression_ratios = (args.compression_ratio,)
+        config.validate()
     if args.command == "prepare":
         tasks = load_tasks("qwen25", config.formal_tasks)
         manifest = prepare_data(config, tasks)

@@ -2,7 +2,7 @@
 
 Fixed-budget multi-scale visual KV routing for Qwen2.5-VL and Qwen3.5.
 
-TokenFovea keeps prompt prefill unchanged, builds one pre-RoPE visual KV pyramid per routed decoder layer, and substitutes a fixed-size spatial front for the fine visual tokens in decode-time attention. The original Hugging Face cache is retained for generation bookkeeping and is not compressed.
+TokenFovea builds one pre-RoPE visual KV pyramid per routed decoder layer. E4 routed modes prefill through the penultimate prompt token with an initialized fixed-budget front, update it from that prefix's signals, and run the final prompt token through every routed layer with the updated front. Its logits produce the first generated token; later decode steps continue updating dynamically. The original Hugging Face cache is retained for generation bookkeeping and is not physically compressed.
 
 This repository currently contains the routing implementation and its core tests. Experiment-specific probe and evaluation pipelines are intentionally outside the core package.
 
@@ -91,6 +91,8 @@ E3 pairs four fixed visual representations with normal position encoding and dec
 ## E4 formal dynamic routing evaluation
 
 E4 compares token-matched LowRes, fixed Native fronts, prefill-only routing, per-step dynamic routing,
-and E1 Top-8 versus all-head signals on high-resolution and general benchmarks. It provides separate
-official-prompt and multi-token mechanism protocols. See
+and E1 Top-8 versus all-head signals on high-resolution and general benchmarks. The formal and
+reasoning experiments use a configurable primary token ratio (default 8), while the formal-data
+compression experiment sweeps 2/4/6/8/16 by default. Every condition is derived from the same
+8-aligned high-resolution grid and LowRes/Native use one exact per-sample budget. See
 [`experiments/e4/README.md`](experiments/e4/README.md).

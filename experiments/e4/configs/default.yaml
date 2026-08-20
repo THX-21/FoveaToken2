@@ -1,5 +1,7 @@
 seed: 42
 visual_token_cap: 4096
+compression_ratio: 8
+compression_ratios: [2, 4, 6, 8, 16]
 formal_max_new_tokens: 128
 reasoning_max_new_tokens: 256
 mechanism_count: 100

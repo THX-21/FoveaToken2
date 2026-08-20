@@ -27,7 +27,7 @@ class PatchHandle:
 
 
 def install_tokenfovea(model: torch.nn.Module, session: FoveaSession) -> PatchHandle:
-    """Patch Qwen full-attention layers while leaving prompt prefill unchanged."""
+    """Patch Qwen post-image prefill and decode attention with a fixed-budget front."""
     model_any: Any = model
     model_type = getattr(model_any.config, "model_type", "")
     if model_type not in {"qwen2_5_vl", "qwen3_5"}:
