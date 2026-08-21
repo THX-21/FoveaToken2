@@ -164,9 +164,13 @@ def validate_manifest(config: E4Config, payload: dict[str, Any]) -> None:
             raise ValueError(f"E4 {suite} manifest contains duplicate sample IDs")
     logical = payload.get("logical_counts", {})
     for name in ("visualprobe", "vstar_bench", "finers_qa", "hrscene_testmini"):
-        if int(logical.get(name, -1)) != config.mechanism_count:
+        configured = name == "visualprobe" and any(
+            task in config.mechanism_tasks for task in VISUALPROBE_TASKS
+        ) or name in config.mechanism_tasks
+        expected = config.mechanism_count if configured else 0
+        if int(logical.get(name, -1)) != expected:
             raise ValueError(
-                f"E4 mechanism group {name!r} must contain {config.mechanism_count} samples"
+                f"E4 mechanism group {name!r} must contain {expected} samples"
             )
 
 

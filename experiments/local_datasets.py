@@ -30,7 +30,7 @@ E4_REPOS = {
     ),
     "Wenliang04/HRScene": (
         "testmini",
-        "hrscene/realworld_combined/testmini/*.parquet",
+        "hrscene/realworld_combined/train-*.parquet",
     ),
 }
 
